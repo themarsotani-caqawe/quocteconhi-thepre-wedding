@@ -56,7 +56,7 @@ export function HomePage({ onNavigate }: HomePageProps) {
           </ScallopedCard>
         </div>
 
-        <div className="flex flex-col items-center gap-2.5 pb-2">
+        <div className="flex flex-col items-center gap-3 pb-2">
           <a
             href="/the-pre-wedding-premiere"
             onClick={(e) => {
@@ -73,17 +73,6 @@ export function HomePage({ onNavigate }: HomePageProps) {
             >
               <span className="text-[16px] sm:text-[17px]">Vào The Pre-Wedding Premiere</span>
             </CarnivalButton>
-          </a>
-          <a
-            href="/google-sheet"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate('/google-sheet');
-            }}
-            data-testid="google-sheet-link"
-            className="text-[11.5px] font-medium text-[#6d1d36]/75 hover:text-[#6d1d36] underline underline-offset-2"
-          >
-            Tổng hợp &amp; trả lời qua Google Sheet
           </a>
         </div>
       </motion.div>

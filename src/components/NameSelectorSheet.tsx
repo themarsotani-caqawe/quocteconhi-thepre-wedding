@@ -1,13 +1,16 @@
-import { ChevronDown, Check, X } from 'lucide-react';
-import { GUEST_ENTRIES, type GuestEntry, type TeamId } from '../shared/premiereRules';
+import { useState } from 'react';
+import { ChevronDown, Check, RotateCcw, X } from 'lucide-react';
+import { GUEST_ENTRIES, TOTAL_PEOPLE, type GuestEntry, type TeamId } from '../shared/premiereRules';
 
 interface NameSelectorSheetProps {
   isOpen: boolean;
   selectedEntryId: string | null;
   assignments: Record<string, TeamId>;
+  totalAssigned?: number;
   onOpen: () => void;
   onClose: () => void;
   onSelect: (entry: GuestEntry) => void;
+  onResetLocal?: () => void;
   disabled?: boolean;
 }
 
@@ -15,12 +18,20 @@ export function NameSelectorSheet({
   isOpen,
   selectedEntryId,
   assignments,
+  totalAssigned = 0,
   onOpen,
   onClose,
   onSelect,
+  onResetLocal,
   disabled = false,
 }: NameSelectorSheetProps) {
   const selectedEntry = GUEST_ENTRIES.find((e) => e.id === selectedEntryId) ?? null;
+  const [confirmingReset, setConfirmingReset] = useState(false);
+
+  const handleClose = () => {
+    setConfirmingReset(false);
+    onClose();
+  };
 
   return (
     <>
@@ -51,7 +62,7 @@ export function NameSelectorSheet({
           aria-modal="true"
           aria-label="Chọn tên khách mời"
           className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-[#531227]/45 backdrop-blur-[2px] p-0 sm:p-4"
-          onClick={onClose}
+          onClick={handleClose}
         >
           <div
             className="w-full max-w-[440px] max-h-[82dvh] rounded-t-[28px] sm:rounded-[28px] bg-[#fdfbf2] border-2 border-[#6d1d36] shadow-2xl flex flex-col overflow-hidden"
@@ -63,13 +74,13 @@ export function NameSelectorSheet({
                 <h2 className="font-display font-bold text-xl text-[#6d1d36]">
                   Chọn tên của bạn
                 </h2>
-                <p className="text-xs text-[#6d1d36]/75 mt-0.5">
-                  Nếu tên đã quay rồi, bạn sẽ xem lại đúng đội của mình
+                <p className="text-xs text-[#6d1d36]/75 mt-0.5 tabular-nums">
+                  {totalAssigned}/{TOTAL_PEOPLE} khách đã quay trên thiết bị này
                 </p>
               </div>
               <button
                 type="button"
-                onClick={onClose}
+                onClick={handleClose}
                 aria-label="Đóng danh sách tên"
                 className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-full text-[#6d1d36] hover:bg-[#f8bed0]/40 cursor-pointer"
               >
@@ -89,9 +100,7 @@ export function NameSelectorSheet({
                     onClick={() => onSelect(entry)}
                     data-testid={`guest-option-${entry.id}`}
                     className={`w-full min-h-[50px] px-3.5 py-2.5 flex items-center justify-between gap-3 text-left rounded-xl transition-colors cursor-pointer ${
-                      isSelected
-                        ? 'bg-[#fbd4df]/65'
-                        : 'hover:bg-[#fceef2]'
+                      isSelected ? 'bg-[#fbd4df]/65' : 'hover:bg-[#fceef2]'
                     }`}
                   >
                     <div className="min-w-0 flex-1">
@@ -121,6 +130,47 @@ export function NameSelectorSheet({
                 );
               })}
             </div>
+
+            {/* Quiet local reset footer when at least 1 spin exists on this device */}
+            {onResetLocal && totalAssigned > 0 && (
+              <div className="px-4 py-2.5 border-t border-[#6d1d36]/15 bg-[#faf4de]/65 flex items-center justify-between gap-2">
+                {!confirmingReset ? (
+                  <button
+                    type="button"
+                    data-testid="local-reset-trigger"
+                    onClick={() => setConfirmingReset(true)}
+                    className="mx-auto inline-flex items-center gap-1.5 text-xs font-medium text-[#6d1d36]/75 hover:text-[#6d1d36] underline underline-offset-2 cursor-pointer py-1"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>Xóa lượt quay đã lưu trên máy này</span>
+                  </button>
+                ) : (
+                  <div className="w-full flex items-center justify-between gap-2 text-xs">
+                    <span className="font-medium text-[#6d1d36]">Đặt lại về 0/{TOTAL_PEOPLE}?</span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setConfirmingReset(false)}
+                        className="rounded-full border border-[#6d1d36]/35 bg-white px-3 py-1 font-semibold text-[#6d1d36] cursor-pointer"
+                      >
+                        Huỷ
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="local-reset-confirm"
+                        onClick={() => {
+                          setConfirmingReset(false);
+                          onResetLocal();
+                        }}
+                        className="rounded-full border border-[#6d1d36] bg-[#f8bed0] px-3 py-1 font-bold text-[#6d1d36] cursor-pointer"
+                      >
+                        Đặt lại
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}

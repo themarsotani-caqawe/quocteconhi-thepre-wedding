@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { motion } from 'motion/react';
 import { AgendaView } from '../components/AgendaView';
 import {
@@ -11,6 +11,13 @@ import { NameSelectorSheet } from '../components/NameSelectorSheet';
 import { PremiereMarqueeHeader } from '../components/PremiereMarqueeHeader';
 import { PrizeWheel } from '../components/PrizeWheel';
 import { TeamView } from '../components/TeamView';
+import {
+  autofillRoomExceptOneLocally,
+  loadRoomState,
+  openBagLocally,
+  resetRoomLocally,
+  spinEntryLocally,
+} from '../lib/localPremiereStore';
 import {
   ENTRY_BY_ID,
   computeWheelTargetAngle,
@@ -28,8 +35,7 @@ export function PremiereEventPage() {
   const room = useMemo(() => getRoomFromSearch(), []);
   const storageKey = `qtcnhi_viewer_entry_${room}`;
 
-  const [roomState, setRoomState] = useState<RoomPublicState | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [roomState, setRoomState] = useState<RoomPublicState>(() => loadRoomState(room));
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(() => {
     try {
       const saved = localStorage.getItem(storageKey);
@@ -55,6 +61,7 @@ export function PremiereEventPage() {
   // Bag opening state
   const [isOpeningBag, setIsOpeningBag] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
+  const openBagTimerRef = useRef<number | null>(null);
 
   // Persist only the currently viewed guest entry ID locally
   useEffect(() => {
@@ -69,82 +76,28 @@ export function PremiereEventPage() {
     }
   }, [selectedEntryId, storageKey]);
 
-  const fetchLatestState = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/state?room=${room}`, { cache: 'no-store' });
-      if (!res.ok) throw new Error('Không tải được dữ liệu sự kiện');
-      const data = (await res.json()) as RoomPublicState;
-      setRoomState(data);
-      setLoadError(null);
-    } catch {
-      setLoadError('Đang kết nối lại máy chủ sự kiện…');
-    }
-  }, [room]);
-
-  // Real-time SSE subscription + visibility/online resync across phones
+  // Sync across tabs on the same browser and clean up timers on unmount
   useEffect(() => {
-    void fetchLatestState();
-
-    let source: EventSource | null = null;
-    let reconnectTimer: number | null = null;
-    let closed = false;
-
-    const connectSse = () => {
-      if (closed) return;
-      source = new EventSource(`/api/events?room=${room}`);
-      source.addEventListener('state', (event) => {
-        try {
-          const next = JSON.parse((event as MessageEvent).data) as RoomPublicState;
-          setRoomState(next);
-          setLoadError(null);
-        } catch {
-          // ignore malformed chunk
-        }
-      });
-      source.onerror = () => {
-        source?.close();
-        if (!closed && reconnectTimer === null) {
-          reconnectTimer = window.setTimeout(() => {
-            reconnectTimer = null;
-            void fetchLatestState();
-            connectSse();
-          }, 2000);
-        }
-      };
+    const handleStorage = () => {
+      setRoomState(loadRoomState(room));
     };
-
-    connectSse();
-
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
-        void fetchLatestState();
-      }
-    };
-    const handleOnline = () => {
-      void fetchLatestState();
-    };
-
-    document.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('online', handleOnline);
+    window.addEventListener('storage', handleStorage);
 
     return () => {
-      closed = true;
-      source?.close();
-      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      window.removeEventListener('storage', handleStorage);
       if (spinTimerRef.current !== null) window.clearTimeout(spinTimerRef.current);
-      document.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('online', handleOnline);
+      if (openBagTimerRef.current !== null) window.clearTimeout(openBagTimerRef.current);
     };
-  }, [fetchLatestState, room]);
+  }, [room]);
 
   const selectedEntry = selectedEntryId ? ENTRY_BY_ID.get(selectedEntryId) ?? null : null;
   const assignedTeamId: TeamId | null =
-    selectedEntryId && roomState ? roomState.assignments[selectedEntryId] ?? null : null;
+    selectedEntryId ? roomState.assignments[selectedEntryId] ?? null : null;
 
   // Show TeamView automatically when the selected guest already has an assigned team
   // and the wheel is not currently in the middle of a spin animation.
   const showTeamView = Boolean(
-    !forceWheelView && !isSpinning && selectedEntry && assignedTeamId && roomState
+    !forceWheelView && !isSpinning && selectedEntry && assignedTeamId
   );
 
   const handleSelectEntry = (entry: GuestEntry) => {
@@ -152,15 +105,10 @@ export function PremiereEventPage() {
     setSpinError(null);
     setOpenError(null);
     setIsSheetOpen(false);
-    // If this guest already spun previously, open their saved team directly
-    if (roomState?.assignments[entry.id]) {
-      setForceWheelView(false);
-    } else {
-      setForceWheelView(false);
-    }
+    setForceWheelView(false);
   };
 
-  const handleStartSpin = async () => {
+  const handleStartSpin = () => {
     if (isSpinning) return;
     setSpinError(null);
 
@@ -169,94 +117,56 @@ export function PremiereEventPage() {
       return;
     }
 
-    // If already assigned in current state, jump straight to their team
-    if (roomState?.assignments[selectedEntryId]) {
+    // If already assigned in local browser storage, jump straight to their team
+    if (roomState.assignments[selectedEntryId]) {
       setForceWheelView(false);
       return;
     }
 
     setIsSpinning(true);
     try {
-      const res = await fetch('/api/spin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ room, entryId: selectedEntryId }),
-      });
-      const payload = (await res.json()) as {
-        teamId?: TeamId;
-        alreadyAssigned?: boolean;
-        state?: RoomPublicState;
-        error?: string;
-      };
+      const result = spinEntryLocally(room, selectedEntryId);
 
-      if (!res.ok || !payload.teamId || !payload.state) {
-        throw new Error(payload.error || 'Chưa thể lưu lượt quay, thử lại nhé.');
-      }
-
-      const assigned = payload.teamId;
-      const latestState = payload.state;
-
-      // If this entry was already assigned earlier (e.g. race or reconnect),
-      // go straight to their saved team; otherwise play full spin animation to exact slice!
-      if (payload.alreadyAssigned) {
-        setRoomState(latestState);
+      if (result.alreadyAssigned) {
+        setRoomState(result.state);
         setIsSpinning(false);
         setForceWheelView(false);
         return;
       }
 
-      const nextAngle = computeWheelTargetAngle(wheelAngle, assigned);
+      const nextAngle = computeWheelTargetAngle(wheelAngle, result.teamId);
       setWheelAngle(nextAngle);
-      setRoomState(latestState);
+      setRoomState(result.state);
 
       spinTimerRef.current = window.setTimeout(() => {
         setIsSpinning(false);
         setForceWheelView(false);
       }, 4350);
     } catch (err) {
-      // On network drop after server saved, pull latest state to check if already saved
-      await fetchLatestState();
       setIsSpinning(false);
       setSpinError(
-        err instanceof Error ? err.message : 'Mạng tạm gián đoạn, vui lòng chạm quay lại.'
+        err instanceof Error ? err.message : 'Chưa thể quay tìm đội lúc này, thử lại nhé.'
       );
     }
   };
 
-  const handleOpenBag = async () => {
+  const handleOpenBag = () => {
     if (!assignedTeamId || isOpeningBag) return;
     setOpenError(null);
     setIsOpeningBag(true);
 
-    try {
-      const res = await fetch('/api/open-bag', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          room,
-          teamId: assignedTeamId,
-          entryId: selectedEntryId,
-        }),
-      });
-      const payload = (await res.json()) as {
-        ok?: boolean;
-        error?: string;
-        state?: RoomPublicState;
-      };
-
-      if (!res.ok || !payload.ok || !payload.state) {
-        throw new Error(payload.error || 'Chưa thể khui túi mù.');
-      }
-
-      // Hold brief opening animation state so the bow unties before settling
-      window.setTimeout(() => {
-        if (payload.state) setRoomState(payload.state);
-        setIsOpeningBag(false);
-      }, 450);
-    } catch (err) {
+    const result = openBagLocally(room, assignedTeamId, selectedEntryId ?? undefined);
+    if (!result.ok) {
       setIsOpeningBag(false);
-      setOpenError(err instanceof Error ? err.message : 'Không thể khui túi mù lúc này.');
+      setOpenError(result.error || 'Chưa thể khui túi mù.');
+      return;
     }
+
+    // Hold brief opening animation state so the bow unties before settling
+    openBagTimerRef.current = window.setTimeout(() => {
+      setRoomState(result.state);
+      setIsOpeningBag(false);
+    }, 450);
   };
 
   const handleSwitchViewer = () => {
@@ -267,37 +177,30 @@ export function PremiereEventPage() {
     setIsSheetOpen(true);
   };
 
-  const handleDemoAutofill = async () => {
-    const targetEntry = selectedEntryId || 'celine-phang';
-    const res = await fetch('/api/demo/autofill', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ room: 'demo', keepEntryId: targetEntry }),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { state: RoomPublicState };
-      setRoomState(data.state);
-      if (!selectedEntryId) {
-        setSelectedEntryId(targetEntry);
-      }
-      setForceWheelView(false);
-    }
+  const handleResetLocalRoom = () => {
+    const fresh = resetRoomLocally(room);
+    setRoomState(fresh);
+    setSelectedEntryId(null);
+    setForceWheelView(false);
+    setIsSpinning(false);
+    setIsOpeningBag(false);
+    setSpinError(null);
+    setOpenError(null);
+    setIsSheetOpen(false);
   };
 
-  const handleDemoReset = async () => {
-    const res = await fetch('/api/demo/reset', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ room: 'demo' }),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { state: RoomPublicState };
-      setRoomState(data.state);
-      setSelectedEntryId(null);
-      setForceWheelView(false);
-      setIsSpinning(false);
-      setIsOpeningBag(false);
+  const handleDemoAutofill = () => {
+    const targetEntry = selectedEntryId || 'celine-phang';
+    const next = autofillRoomExceptOneLocally('demo', targetEntry);
+    setRoomState(next);
+    if (!selectedEntryId) {
+      setSelectedEntryId(targetEntry);
     }
+    setForceWheelView(false);
+  };
+
+  const handleDemoReset = () => {
+    handleResetLocalRoom();
   };
 
   return (
@@ -409,13 +312,7 @@ export function PremiereEventPage() {
         </div>
       ) : (
         <div role="tabpanel" id="panel-spin" aria-labelledby="tab-spin" className="flex-1 flex flex-col">
-          {loadError && !roomState && (
-            <div className="my-auto text-center text-sm font-medium text-[#6d1d36]">
-              {loadError}
-            </div>
-          )}
-
-          {showTeamView && roomState && assignedTeamId && selectedEntry ? (
+          {showTeamView && assignedTeamId && selectedEntry ? (
             <TeamView
               team={roomState.teams[assignedTeamId]}
               viewerEntry={selectedEntry}
@@ -439,11 +336,10 @@ export function PremiereEventPage() {
                   isSpinning={isSpinning}
                   inviteBounce={Boolean(selectedEntryId && !assignedTeamId)}
                   onWheelClick={handleStartSpin}
-                  disabled={!roomState}
                 />
               </div>
 
-              {/* Name Selector & Spin CTA */}
+              {/* Name Selector & Spin CTA (bright and ready immediately on load) */}
               <div className="flex flex-col gap-2">
                 {spinError && (
                   <p role="alert" className="text-xs font-medium text-[#9e1c38] text-center">
@@ -454,10 +350,12 @@ export function PremiereEventPage() {
                 <NameSelectorSheet
                   isOpen={isSheetOpen}
                   selectedEntryId={selectedEntryId}
-                  assignments={roomState?.assignments ?? {}}
+                  assignments={roomState.assignments}
+                  totalAssigned={roomState.totalPeopleAssigned}
                   onOpen={() => setIsSheetOpen(true)}
                   onClose={() => setIsSheetOpen(false)}
                   onSelect={handleSelectEntry}
+                  onResetLocal={handleResetLocalRoom}
                   disabled={isSpinning}
                 />
 
@@ -465,7 +363,7 @@ export function PremiereEventPage() {
                   type="button"
                   variant="pink"
                   onClick={handleStartSpin}
-                  disabled={isSpinning || !roomState}
+                  disabled={isSpinning}
                   data-testid="spin-cta-button"
                 >
                   {isSpinning ? 'Đang quay tìm đội…' : 'Quay liền tay'}
