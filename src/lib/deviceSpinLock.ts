@@ -7,8 +7,8 @@ export interface DeviceSpinLock {
   spunAt: string;
 }
 
-const STORAGE_PREFIX = 'qtcnhi_device_spin_lock_v2_';
-const COOKIE_PREFIX = 'qtcnhi_spin_lock_v2_';
+const STORAGE_PREFIX = 'qtcnhi_device_spin_lock_v3_';
+const COOKIE_PREFIX = 'qtcnhi_spin_lock_v3_';
 const ONE_YEAR_SECONDS = 31_536_000;
 
 function isTeamId(value: unknown): value is TeamId {

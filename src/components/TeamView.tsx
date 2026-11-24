@@ -20,6 +20,7 @@ interface TeamViewProps {
   openError: string | null;
   deviceLocked: boolean;
   onOpenBag: () => void;
+  onViewWheel?: () => void;
 }
 
 export function TeamView({
@@ -29,6 +30,7 @@ export function TeamView({
   openError,
   deviceLocked,
   onOpenBag,
+  onViewWheel,
 }: TeamViewProps) {
   const remaining = Math.max(0, team.capacity - team.memberCount);
   const emptySlotCount = remaining;
@@ -209,12 +211,24 @@ export function TeamView({
 
         {/* Strict 1-spin-per-device lock badge */}
         {deviceLocked && (
-          <div
-            data-testid="device-locked-note"
-            className="mt-1 inline-flex items-center gap-1.5 text-[11.5px] font-medium text-[#6d1d36]/75"
-          >
-            <Lock className="w-3.5 h-3.5" aria-hidden="true" />
-            <span>Thiết bị đã hoàn tất lượt quay cho {viewerEntry.label}</span>
+          <div className="mt-1 flex flex-col items-center gap-1.5">
+            <div
+              data-testid="device-locked-note"
+              className="inline-flex items-center gap-1.5 text-[11.5px] font-medium text-[#6d1d36]/75"
+            >
+              <Lock className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Thiết bị đã hoàn tất lượt quay cho {viewerEntry.label}</span>
+            </div>
+            {onViewWheel && (
+              <button
+                type="button"
+                onClick={onViewWheel}
+                data-testid="view-wheel-button"
+                className="text-xs font-semibold text-[#a44564] underline hover:text-[#6d1d36] cursor-pointer py-1 px-2"
+              >
+                Xem lại vòng quay tìm đội
+              </button>
+            )}
           </div>
         )}
       </div>

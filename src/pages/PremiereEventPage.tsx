@@ -102,6 +102,7 @@ export function PremiereEventPage() {
   const [activeTab, setActiveTab] = useState<'spin' | 'agenda'>('spin');
 
   const [isSheetOpen, setIsSheetOpen] = useState(false);
+  const [viewingWheelAfterLock, setViewingWheelAfterLock] = useState(false);
 
   // Spin state
   const [wheelAngle, setWheelAngle] = useState(0);
@@ -270,9 +271,9 @@ export function PremiereEventPage() {
   const isAllFull = roomState.isAllFull;
   const isDeviceLocked = Boolean(deviceLock);
 
-  // Show TeamView when this device has completed its spin (or while locked) and wheel isn't spinning
+  // Show TeamView when this device has completed its spin unless user chooses to view the wheel again
   const showTeamView = Boolean(
-    !isSpinning && isDeviceLocked && selectedEntry && assignedTeamId
+    !isSpinning && isDeviceLocked && selectedEntry && assignedTeamId && !viewingWheelAfterLock
   );
 
   // Spin button is strictly locked unless:
@@ -315,6 +316,7 @@ export function PremiereEventPage() {
       };
       writeDeviceSpinLock(room, lock);
       setDeviceLock(lock);
+      setViewingWheelAfterLock(false);
       setIsSpinning(false);
     }, 4350);
   };
@@ -497,6 +499,7 @@ export function PremiereEventPage() {
     clearDeviceSpinLock(targetRoom);
     setDeviceLock(null);
     setSelectedEntryId(null);
+    setViewingWheelAfterLock(false);
     setRoomState(nextState);
     setIsSpinning(false);
     setIsOpeningBag(false);
@@ -743,6 +746,7 @@ export function PremiereEventPage() {
               openError={openError}
               deviceLocked={isDeviceLocked}
               onOpenBag={handleOpenBag}
+              onViewWheel={() => setViewingWheelAfterLock(true)}
             />
           ) : (
             <motion.div
@@ -809,6 +813,17 @@ export function PremiereEventPage() {
                 >
                   <span className="text-[17px] sm:text-[19px]">{spinButtonLabel}</span>
                 </CarnivalButton>
+
+                {isDeviceLocked && assignedTeamId && (
+                  <button
+                    type="button"
+                    onClick={() => setViewingWheelAfterLock(false)}
+                    data-testid="back-to-team-button"
+                    className="w-full min-h-[44px] rounded-full border-2 border-[#6d1d36] bg-[#d6eef8] px-4 py-2 font-display font-bold text-[15px] text-[#6d1d36] shadow-[0_2px_0_#6d1d36] hover:bg-[#c5e6f4] transition-colors cursor-pointer"
+                  >
+                    Xem kết quả Đội {assignedTeamId} của bạn
+                  </button>
+                )}
               </div>
             </motion.div>
           )}

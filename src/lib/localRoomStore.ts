@@ -24,8 +24,8 @@ export interface LocalRoomSnapshot {
   openedBags: Partial<Record<TeamId, string>>;
 }
 
-const LOCAL_ROOM_STORAGE_PREFIX = 'qtcnhi_local_room_v2_';
-const DEFAULT_LOCAL_EPOCH = 'local-v2';
+const LOCAL_ROOM_STORAGE_PREFIX = 'qtcnhi_local_room_v3_';
+const DEFAULT_LOCAL_EPOCH = 'local-v3';
 
 export function isTeamId(value: unknown): value is TeamId {
   return value === 1 || value === 2 || value === 3 || value === 4;

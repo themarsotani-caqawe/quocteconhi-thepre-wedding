@@ -25,7 +25,7 @@ export function TeamsOverviewCard({
             <div className="flex items-center gap-1.5">
               <GoldStar className="w-3.5 h-3.5" />
               <h2 className="font-display font-bold text-[17px] leading-tight text-[#6d1d36]">
-                Danh sách thành viên 4 đội
+                Danh sách thành viên 4 đội (Công khai)
               </h2>
             </div>
 
