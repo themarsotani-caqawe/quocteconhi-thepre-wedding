@@ -20,12 +20,23 @@ import {
   type DeviceSpinLock,
 } from '../lib/deviceSpinLock';
 import {
+  autofillDemoLocalRoomState,
+  isValidRoomPublicState,
+  openLocalRoomBag,
+  readLocalRoomState,
+  resetLocalRoomState,
+  saveRemoteStateToLocal,
+  spinLocalRoomState,
+} from '../lib/localRoomStore';
+import {
   ENTRY_BY_ID,
   computeWheelTargetAngle,
   type GuestEntry,
   type RoomPublicState,
   type TeamId,
 } from '../shared/premiereRules';
+
+const REMOTE_TIMEOUT_MS = 2200;
 
 function getRoomFromSearch(): 'live' | 'demo' {
   const params = new URLSearchParams(window.location.search);
@@ -37,12 +48,36 @@ function getIsOwnerFromSearch(): boolean {
   return params.get('owner') === 'true';
 }
 
+async function fetchJsonWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = REMOTE_TIMEOUT_MS
+): Promise<{ status: number; ok: boolean; data: unknown }> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+    const contentType = res.headers.get('content-type') ?? '';
+    if (!contentType.toLowerCase().includes('application/json')) {
+      throw new Error('Non-JSON response');
+    }
+    const data: unknown = await res.json();
+    return { status: res.status, ok: res.ok, data };
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 export function PremiereEventPage() {
   const room = useMemo(() => getRoomFromSearch(), []);
   const isOwner = useMemo(() => getIsOwnerFromSearch(), []);
 
-  const [roomState, setRoomState] = useState<RoomPublicState | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  // Always initialize synchronously from browser-local state so UI is immediately usable
+  // without ever blocking on external shared sync.
+  const [roomState, setRoomState] = useState<RoomPublicState>(() => readLocalRoomState(room));
 
   // Strict per-device lock stored in BOTH localStorage & cookie
   const [deviceLock, setDeviceLock] = useState<DeviceSpinLock | null>(() =>
@@ -69,78 +104,112 @@ export function PremiereEventPage() {
   const [openError, setOpenError] = useState<string | null>(null);
   const openBagTimerRef = useRef<number | null>(null);
 
+  // Track whether optional backend API is genuinely reachable (null = probing, true = active, false = local mode)
+  const remoteAvailableRef = useRef<boolean | null>(null);
+
   const reconcileLockWithState = useCallback(
     (nextState: RoomPublicState) => {
+      const current = readDeviceSpinLock(room);
+      // Preserve offline/local spin lock across optional remote refreshes unless cleared by explicit reset
+      if (current && current.epoch.startsWith('local-') && !nextState.epoch.startsWith('local-')) {
+        return !nextState.assignments[current.entryId];
+      }
       const verified = readDeviceSpinLock(room, nextState.epoch);
       setDeviceLock(verified);
       if (verified) {
         setSelectedEntryId(verified.entryId);
       }
+      return false;
     },
     [room]
   );
 
-  const fetchLatestState = useCallback(async () => {
+  const applyRemoteState = useCallback(
+    (next: RoomPublicState) => {
+      const hasUnmergedLocalSpin = reconcileLockWithState(next);
+      if (hasUnmergedLocalSpin) {
+        return;
+      }
+      saveRemoteStateToLocal(room, next);
+      setRoomState(next);
+    },
+    [reconcileLockWithState, room]
+  );
+
+  const fetchLatestState = useCallback(async (): Promise<boolean> => {
     try {
-      const res = await fetch(`/api/state?room=${room}`, { cache: 'no-store' });
-      if (!res.ok) throw new Error('Không tải được dữ liệu sự kiện');
-      const data = (await res.json()) as RoomPublicState;
-      setRoomState(data);
-      reconcileLockWithState(data);
-      setLoadError(null);
+      const { ok, data } = await fetchJsonWithTimeout(`/api/state?room=${room}`, {
+        cache: 'no-store',
+      });
+      if (!ok || !isValidRoomPublicState(data)) {
+        remoteAvailableRef.current = false;
+        return false;
+      }
+      remoteAvailableRef.current = true;
+      applyRemoteState(data);
+      return true;
     } catch {
-      setLoadError('Đang kết nối lại dữ liệu chung…');
+      // Silently ignore external sync errors/timeouts and keep running in browser-local mode
+      remoteAvailableRef.current = false;
+      return false;
     }
-  }, [reconcileLockWithState, room]);
+  }, [applyRemoteState, room]);
 
-  // Real-time SSE + periodic sync fallback across phones
+  // Optional real-time SSE + periodic sync only when backend API responds cleanly
   useEffect(() => {
-    void fetchLatestState();
-
     let source: EventSource | null = null;
+    let pollInterval: number | null = null;
     let reconnectTimer: number | null = null;
     let closed = false;
 
     const connectSse = () => {
-      if (closed) return;
+      if (closed || remoteAvailableRef.current !== true || source) return;
       source = new EventSource(`/api/events?room=${room}`);
       source.addEventListener('state', (event) => {
         try {
-          const next = JSON.parse((event as MessageEvent).data) as RoomPublicState;
-          setRoomState(next);
-          reconcileLockWithState(next);
-          setLoadError(null);
+          const next: unknown = JSON.parse((event as MessageEvent).data);
+          if (isValidRoomPublicState(next)) {
+            applyRemoteState(next);
+          }
         } catch {
           // ignore malformed chunk
         }
       });
       source.onerror = () => {
         source?.close();
-        if (!closed && reconnectTimer === null) {
+        source = null;
+        if (!closed && remoteAvailableRef.current === true && reconnectTimer === null) {
           reconnectTimer = window.setTimeout(() => {
             reconnectTimer = null;
-            void fetchLatestState();
-            connectSse();
-          }, 2500);
+            void fetchLatestState().then((ok) => {
+              if (ok) connectSse();
+            });
+          }, 5000);
         }
       };
     };
 
-    connectSse();
-
-    const pollInterval = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        void fetchLatestState();
-      }
-    }, 5000);
+    void fetchLatestState().then((ok) => {
+      if (closed || !ok) return;
+      connectSse();
+      pollInterval = window.setInterval(() => {
+        if (document.visibilityState === 'visible' && remoteAvailableRef.current === true) {
+          void fetchLatestState();
+        }
+      }, 5000);
+    });
 
     const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && remoteAvailableRef.current === true) {
         void fetchLatestState();
       }
     };
     const handleOnline = () => {
-      void fetchLatestState();
+      if (remoteAvailableRef.current !== false) {
+        void fetchLatestState().then((ok) => {
+          if (ok) connectSse();
+        });
+      }
     };
 
     document.addEventListener('visibilitychange', handleVisibility);
@@ -149,38 +218,36 @@ export function PremiereEventPage() {
     return () => {
       closed = true;
       source?.close();
-      window.clearInterval(pollInterval);
+      if (pollInterval !== null) window.clearInterval(pollInterval);
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       if (spinTimerRef.current !== null) window.clearTimeout(spinTimerRef.current);
       if (openBagTimerRef.current !== null) window.clearTimeout(openBagTimerRef.current);
       document.removeEventListener('visibilitychange', handleVisibility);
       window.removeEventListener('online', handleOnline);
     };
-  }, [fetchLatestState, reconcileLockWithState, room]);
+  }, [applyRemoteState, fetchLatestState, room]);
 
   const effectiveEntryId = deviceLock?.entryId ?? selectedEntryId;
   const selectedEntry = effectiveEntryId ? ENTRY_BY_ID.get(effectiveEntryId) ?? null : null;
   const assignedTeamId: TeamId | null =
     deviceLock?.teamId ??
-    (effectiveEntryId && roomState ? roomState.assignments[effectiveEntryId] ?? null : null);
+    (effectiveEntryId ? roomState.assignments[effectiveEntryId] ?? null : null);
 
-  const isAllFull = Boolean(roomState?.isAllFull);
+  const isAllFull = roomState.isAllFull;
   const isDeviceLocked = Boolean(deviceLock);
 
   // Show TeamView when this device has completed its spin (or while locked) and wheel isn't spinning
   const showTeamView = Boolean(
-    !isSpinning && isDeviceLocked && selectedEntry && assignedTeamId && roomState
+    !isSpinning && isDeviceLocked && selectedEntry && assignedTeamId
   );
 
   // Spin button is strictly locked unless:
-  // - roomState loaded
   // - all 4 teams are NOT 5/5 full
   // - this device has NOT already spun
   // - guest has explicitly selected an unassigned name from dropdown
   // - wheel is not currently spinning
   const canSpin = Boolean(
-    roomState &&
-      !isAllFull &&
+    !isAllFull &&
       !isDeviceLocked &&
       selectedEntryId &&
       !roomState.assignments[selectedEntryId] &&
@@ -189,11 +256,33 @@ export function PremiereEventPage() {
 
   const handleSelectEntry = (entry: GuestEntry) => {
     if (isDeviceLocked) return;
-    if (roomState?.assignments[entry.id]) return;
+    if (roomState.assignments[entry.id]) return;
     setSelectedEntryId(entry.id);
     setSpinError(null);
     setOpenError(null);
     setIsSheetOpen(false);
+  };
+
+  const commitWheelSpinResult = (
+    entryId: string,
+    assigned: TeamId,
+    latestState: RoomPublicState
+  ) => {
+    const nextAngle = computeWheelTargetAngle(wheelAngle, assigned);
+    setWheelAngle(nextAngle);
+    setRoomState(latestState);
+
+    spinTimerRef.current = window.setTimeout(() => {
+      const lock: DeviceSpinLock = {
+        epoch: latestState.epoch,
+        entryId,
+        teamId: assigned,
+        spunAt: new Date().toISOString(),
+      };
+      writeDeviceSpinLock(room, lock);
+      setDeviceLock(lock);
+      setIsSpinning(false);
+    }, 4350);
   };
 
   const handleStartSpin = async () => {
@@ -206,61 +295,67 @@ export function PremiereEventPage() {
       return;
     }
 
-    if (!roomState) return;
     if (roomState.assignments[selectedEntryId]) {
       setSpinError('Tên này đã quay trước đó. Vui lòng chọn tên khác chưa quay.');
       return;
     }
 
     setIsSpinning(true);
-    try {
-      const res = await fetch('/api/spin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ room, entryId: selectedEntryId }),
-      });
-      const payload = (await res.json()) as {
-        teamId?: TeamId;
-        alreadyAssigned?: boolean;
-        state?: RoomPublicState;
-        error?: string;
-      };
 
-      if (!res.ok || !payload.teamId || !payload.state) {
-        throw new Error(payload.error || 'Chưa thể lưu lượt quay, thử lại nhé.');
+    // If backend API is confirmed reachable, try shared spin first; otherwise or on error/timeout, spin locally immediately
+    if (remoteAvailableRef.current === true) {
+      try {
+        const { status, ok, data } = await fetchJsonWithTimeout('/api/spin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ room, entryId: selectedEntryId }),
+        });
+        const payload = data as {
+          teamId?: TeamId;
+          alreadyAssigned?: boolean;
+          state?: RoomPublicState;
+          error?: string;
+        };
+
+        if (payload.alreadyAssigned && payload.state && isValidRoomPublicState(payload.state)) {
+          applyRemoteState(payload.state);
+          setIsSpinning(false);
+          setSpinError('Tên này vừa được quay ở một thiết bị khác. Hãy chọn lại tên của bạn.');
+          setSelectedEntryId(null);
+          return;
+        }
+
+        if (ok && payload.teamId && payload.state && isValidRoomPublicState(payload.state)) {
+          saveRemoteStateToLocal(room, payload.state);
+          commitWheelSpinResult(selectedEntryId, payload.teamId, payload.state);
+          return;
+        }
+
+        if (status >= 400 && status < 500 && status !== 404 && payload.error) {
+          setIsSpinning(false);
+          setSpinError(payload.error);
+          return;
+        }
+      } catch {
+        // Fall through to local spin if remote server failed or timed out
+        remoteAvailableRef.current = false;
       }
+    }
 
-      const assigned = payload.teamId;
-      const latestState = payload.state;
-
-      if (payload.alreadyAssigned) {
-        setRoomState(latestState);
+    try {
+      const localResult = spinLocalRoomState(room, selectedEntryId);
+      if (localResult.alreadyAssigned) {
+        setRoomState(localResult.state);
         setIsSpinning(false);
-        setSpinError('Tên này vừa được quay ở một thiết bị khác. Hãy chọn lại tên của bạn.');
+        setSpinError('Tên này đã quay trước đó. Vui lòng chọn tên khác chưa quay.');
         setSelectedEntryId(null);
         return;
       }
-
-      const nextAngle = computeWheelTargetAngle(wheelAngle, assigned);
-      setWheelAngle(nextAngle);
-      setRoomState(latestState);
-
-      spinTimerRef.current = window.setTimeout(() => {
-        const lock: DeviceSpinLock = {
-          epoch: latestState.epoch,
-          entryId: selectedEntryId,
-          teamId: assigned,
-          spunAt: new Date().toISOString(),
-        };
-        writeDeviceSpinLock(room, lock);
-        setDeviceLock(lock);
-        setIsSpinning(false);
-      }, 4350);
+      commitWheelSpinResult(selectedEntryId, localResult.teamId, localResult.state);
     } catch (err) {
-      await fetchLatestState();
       setIsSpinning(false);
       setSpinError(
-        err instanceof Error ? err.message : 'Mạng tạm gián đoạn, vui lòng thử lại.'
+        err instanceof Error ? err.message : 'Chưa thể thực hiện lượt quay, thử lại nhé.'
       );
     }
   };
@@ -270,28 +365,47 @@ export function PremiereEventPage() {
     setOpenError(null);
     setIsOpeningBag(true);
 
-    try {
-      const res = await fetch('/api/open-bag', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          room,
-          teamId: assignedTeamId,
-          entryId: effectiveEntryId,
-        }),
-      });
-      const payload = (await res.json()) as {
-        ok?: boolean;
-        error?: string;
-        state?: RoomPublicState;
-      };
+    if (remoteAvailableRef.current === true) {
+      try {
+        const { ok, status, data } = await fetchJsonWithTimeout('/api/open-bag', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            room,
+            teamId: assignedTeamId,
+            entryId: effectiveEntryId,
+          }),
+        });
+        const payload = data as {
+          ok?: boolean;
+          error?: string;
+          state?: RoomPublicState;
+        };
 
-      if (!res.ok || !payload.ok || !payload.state) {
-        throw new Error(payload.error || 'Chưa thể khui túi mù.');
+        if (ok && payload.ok && payload.state && isValidRoomPublicState(payload.state)) {
+          const nextState = payload.state;
+          saveRemoteStateToLocal(room, nextState);
+          openBagTimerRef.current = window.setTimeout(() => {
+            setRoomState(nextState);
+            setIsOpeningBag(false);
+          }, 450);
+          return;
+        }
+
+        if (status >= 400 && status < 500 && status !== 404 && payload.error) {
+          setIsOpeningBag(false);
+          setOpenError(payload.error);
+          return;
+        }
+      } catch {
+        remoteAvailableRef.current = false;
       }
+    }
 
+    try {
+      const nextState = openLocalRoomBag(room, assignedTeamId);
       openBagTimerRef.current = window.setTimeout(() => {
-        if (payload.state) setRoomState(payload.state);
+        setRoomState(nextState);
         setIsOpeningBag(false);
       }, 450);
     } catch (err) {
@@ -300,67 +414,101 @@ export function PremiereEventPage() {
     }
   };
 
+  const applyResetSuccess = (nextState: RoomPublicState, targetRoom: 'live' | 'demo') => {
+    clearDeviceSpinLock(targetRoom);
+    setDeviceLock(null);
+    setSelectedEntryId(null);
+    setRoomState(nextState);
+    setIsSpinning(false);
+    setIsOpeningBag(false);
+    setSpinError(null);
+    setOpenError(null);
+  };
+
   const handleOwnerReset = async () => {
-    const res = await fetch('/api/reset', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ room, owner: true }),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { state: RoomPublicState };
-      clearDeviceSpinLock(room);
-      setDeviceLock(null);
-      setSelectedEntryId(null);
-      setRoomState(data.state);
-      setIsSpinning(false);
-      setIsOpeningBag(false);
-      setSpinError(null);
-      setOpenError(null);
+    if (remoteAvailableRef.current === true) {
+      try {
+        const { ok, data } = await fetchJsonWithTimeout('/api/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ room, owner: true }),
+        });
+        const payload = data as { state?: RoomPublicState };
+        if (ok && payload.state && isValidRoomPublicState(payload.state)) {
+          saveRemoteStateToLocal(room, payload.state);
+          applyResetSuccess(payload.state, room);
+          return;
+        }
+      } catch {
+        remoteAvailableRef.current = false;
+      }
     }
+
+    const nextState = resetLocalRoomState(room);
+    applyResetSuccess(nextState, room);
   };
 
   const handleDemoAutofill = async () => {
     const targetEntry = selectedEntryId || 'celine-phang';
-    const res = await fetch('/api/demo/autofill', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ room: 'demo', keepEntryId: targetEntry }),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { state: RoomPublicState };
-      setRoomState(data.state);
-      const assigned = data.state.assignments[targetEntry];
-      if (assigned) {
-        const lock: DeviceSpinLock = {
-          epoch: data.state.epoch,
-          entryId: targetEntry,
-          teamId: assigned,
-          spunAt: new Date().toISOString(),
-        };
-        writeDeviceSpinLock('demo', lock);
-        setDeviceLock(lock);
-        setSelectedEntryId(targetEntry);
+    let nextState: RoomPublicState | null = null;
+
+    if (remoteAvailableRef.current === true) {
+      try {
+        const { ok, data } = await fetchJsonWithTimeout('/api/demo/autofill', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ room: 'demo', keepEntryId: targetEntry }),
+        });
+        const payload = data as { state?: RoomPublicState };
+        if (ok && payload.state && isValidRoomPublicState(payload.state)) {
+          nextState = payload.state;
+          saveRemoteStateToLocal('demo', nextState);
+        }
+      } catch {
+        remoteAvailableRef.current = false;
       }
+    }
+
+    if (!nextState) {
+      nextState = autofillDemoLocalRoomState(targetEntry);
+    }
+
+    setRoomState(nextState);
+    const assigned = nextState.assignments[targetEntry];
+    if (assigned) {
+      const lock: DeviceSpinLock = {
+        epoch: nextState.epoch,
+        entryId: targetEntry,
+        teamId: assigned,
+        spunAt: new Date().toISOString(),
+      };
+      writeDeviceSpinLock('demo', lock);
+      setDeviceLock(lock);
+      setSelectedEntryId(targetEntry);
     }
   };
 
   const handleDemoReset = async () => {
-    const res = await fetch('/api/reset', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ room: 'demo', owner: true }),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { state: RoomPublicState };
-      clearDeviceSpinLock('demo');
-      setDeviceLock(null);
-      setSelectedEntryId(null);
-      setRoomState(data.state);
-      setIsSpinning(false);
-      setIsOpeningBag(false);
-      setSpinError(null);
-      setOpenError(null);
+    if (remoteAvailableRef.current === true) {
+      try {
+        const { ok, data } = await fetchJsonWithTimeout('/api/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ room: 'demo', owner: true }),
+        });
+        const payload = data as { state?: RoomPublicState };
+        if (ok && payload.state && isValidRoomPublicState(payload.state)) {
+          saveRemoteStateToLocal('demo', payload.state);
+          applyResetSuccess(payload.state, 'demo');
+          return;
+        }
+      } catch {
+        remoteAvailableRef.current = false;
+      }
     }
+
+    const nextState = resetLocalRoomState('demo');
+    applyResetSuccess(nextState, 'demo');
   };
 
   let spinButtonLabel = 'Quay liền tay';
@@ -477,13 +625,7 @@ export function PremiereEventPage() {
         </div>
       ) : (
         <div role="tabpanel" id="panel-spin" aria-labelledby="tab-spin" className="flex-1 flex flex-col">
-          {loadError && !roomState && (
-            <div className="my-auto text-center text-sm font-medium text-[#6d1d36]">
-              {loadError}
-            </div>
-          )}
-
-          {showTeamView && roomState && assignedTeamId && selectedEntry ? (
+          {showTeamView && assignedTeamId && selectedEntry ? (
             <TeamView
               team={roomState.teams[assignedTeamId]}
               viewerEntry={selectedEntry}
@@ -539,13 +681,13 @@ export function PremiereEventPage() {
                 <NameSelectorSheet
                   isOpen={isSheetOpen}
                   selectedEntryId={effectiveEntryId}
-                  assignments={roomState?.assignments ?? {}}
-                  totalAssigned={roomState?.totalPeopleAssigned ?? 0}
+                  assignments={roomState.assignments}
+                  totalAssigned={roomState.totalPeopleAssigned}
                   deviceLocked={isDeviceLocked}
                   onOpen={() => setIsSheetOpen(true)}
                   onClose={() => setIsSheetOpen(false)}
                   onSelect={handleSelectEntry}
-                  disabled={isSpinning || !roomState || isAllFull}
+                  disabled={isSpinning || isAllFull}
                 />
 
                 <CarnivalButton
@@ -562,7 +704,7 @@ export function PremiereEventPage() {
           )}
 
           {/* Owner Dashboard rendered right below the wheel / team card when ?owner=true */}
-          {isOwner && roomState && (
+          {isOwner && (
             <OwnerDashboard roomState={roomState} onResetAll={handleOwnerReset} />
           )}
         </div>
