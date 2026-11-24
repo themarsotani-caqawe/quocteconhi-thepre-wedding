@@ -120,7 +120,9 @@ export function OwnerDashboard({ roomState, onResetAll }: OwnerDashboardProps) {
                   >
                     {team.isFull && <Check className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />}
                     <span>
-                      {team.isFull ? 'Đã đủ (5/5)' : `Chưa đủ (còn thiếu ${missing} người)`}
+                      {team.isFull
+                        ? `Đã đủ (${team.memberCount}/${team.capacity})`
+                        : `Chưa đủ (còn thiếu ${missing} người)`}
                     </span>
                   </div>
 
@@ -198,7 +200,7 @@ export function OwnerDashboard({ roomState, onResetAll }: OwnerDashboardProps) {
               </h3>
               <p className="text-xs leading-relaxed text-[#6d1d36]/90">
                 Thao tác này sẽ xóa toàn bộ <strong>{roomState.totalPeopleAssigned}/{roomState.totalPeople}</strong>{' '}
-                lượt quay trên tất cả điện thoại để bắt đầu lại từ đầu (0/5 cho cả 4 đội). Không thể hoàn tác.
+                lượt quay trên tất cả điện thoại để bắt đầu lại từ đầu (0/{roomState.totalPeople} người cho cả 4 đội). Không thể hoàn tác.
               </p>
               <div className="flex items-center justify-end gap-2 pt-1">
                 <button

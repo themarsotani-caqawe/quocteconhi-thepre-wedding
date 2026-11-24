@@ -2,9 +2,10 @@ import { getBagContentsIfOpened } from '../shared/bagSecrets.ts';
 import {
   ENTRY_BY_ID,
   GUEST_ENTRIES,
-  TEAM_CAPACITY,
   TEAM_IDS,
   TOTAL_PEOPLE,
+  getTeamCapacities,
+  pickRandomBonusTeamId,
   pickRandomEligibleTeam,
   type RoomPublicState,
   type TeamId,
@@ -17,13 +18,14 @@ export type RoomMode = 'live' | 'demo';
 
 interface LocalRoomSnapshot {
   epoch: string;
+  bonusTeamId: TeamId;
   assignments: Record<string, TeamId>;
   assignmentOrder: string[];
   openedBags: Partial<Record<TeamId, string>>;
 }
 
-const LOCAL_ROOM_STORAGE_PREFIX = 'qtcnhi_local_room_v1_';
-const DEFAULT_LOCAL_EPOCH = 'local-v1';
+const LOCAL_ROOM_STORAGE_PREFIX = 'qtcnhi_local_room_v2_';
+const DEFAULT_LOCAL_EPOCH = 'local-v2';
 
 function isTeamId(value: unknown): value is TeamId {
   return value === 1 || value === 2 || value === 3 || value === 4;
@@ -37,9 +39,13 @@ function createFreshLocalEpoch(): string {
   return `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-function createDefaultSnapshot(epoch = DEFAULT_LOCAL_EPOCH): LocalRoomSnapshot {
+function createDefaultSnapshot(
+  epoch = DEFAULT_LOCAL_EPOCH,
+  bonusTeamId: TeamId = pickRandomBonusTeamId()
+): LocalRoomSnapshot {
   return {
     epoch,
+    bonusTeamId,
     assignments: {},
     assignmentOrder: [],
     openedBags: {},
@@ -53,7 +59,12 @@ function readLocalSnapshot(room: RoomMode): LocalRoomSnapshot {
       const raw = localStorage.getItem(getStorageKey(room));
       if (raw) {
         const parsed = JSON.parse(raw) as Partial<LocalRoomSnapshot>;
-        if (parsed && typeof parsed.epoch === 'string' && parsed.epoch.length > 0) {
+        if (
+          parsed &&
+          typeof parsed.epoch === 'string' &&
+          parsed.epoch.length > 0 &&
+          isTeamId(parsed.bonusTeamId)
+        ) {
           const cleanAssignments: Record<string, TeamId> = {};
           if (parsed.assignments && typeof parsed.assignments === 'object') {
             for (const [entryId, teamId] of Object.entries(parsed.assignments)) {
@@ -83,6 +94,7 @@ function readLocalSnapshot(room: RoomMode): LocalRoomSnapshot {
           }
           snapshot = {
             epoch: parsed.epoch,
+            bonusTeamId: parsed.bonusTeamId,
             assignments: cleanAssignments,
             assignmentOrder: cleanOrder,
             openedBags: cleanOpenedBags,
@@ -94,18 +106,24 @@ function readLocalSnapshot(room: RoomMode): LocalRoomSnapshot {
     snapshot = null;
   }
 
+  const isFresh = snapshot === null;
   const base = snapshot ?? createDefaultSnapshot();
+  if (isFresh) {
+    // Persist the chosen bonusTeamId immediately so team capacities stay consistent across reloads
+    writeLocalSnapshot(room, base);
+  }
 
   // Reconcile with strict device lock if room snapshot had not persisted this device's spin yet
   const deviceLock = readDeviceSpinLock(room);
   if (
     deviceLock &&
-    (snapshot === null || deviceLock.epoch === base.epoch) &&
+    (isFresh || deviceLock.epoch === base.epoch) &&
     !base.assignments[deviceLock.entryId]
   ) {
-    base.epoch = snapshot === null ? deviceLock.epoch : base.epoch;
+    base.epoch = isFresh ? deviceLock.epoch : base.epoch;
     base.assignments[deviceLock.entryId] = deviceLock.teamId;
     base.assignmentOrder.push(deviceLock.entryId);
+    writeLocalSnapshot(room, base);
   }
 
   return base;
@@ -125,6 +143,7 @@ export function buildRoomPublicState(
   room: RoomMode,
   snapshot: LocalRoomSnapshot
 ): RoomPublicState {
+  const capacities = getTeamCapacities(snapshot.bonusTeamId);
   const teamMembers: Record<TeamId, TeamMemberSlot[]> = { 1: [], 2: [], 3: [], 4: [] };
   let totalPeopleAssigned = 0;
 
@@ -154,13 +173,14 @@ export function buildRoomPublicState(
   for (const teamId of TEAM_IDS) {
     const members = teamMembers[teamId];
     const memberCount = members.length;
-    const isFull = memberCount >= TEAM_CAPACITY;
+    const capacity = capacities[teamId];
+    const isFull = memberCount >= capacity;
     const openedAt = snapshot.openedBags[teamId] ?? null;
     const isOpened = Boolean(openedAt) && isFull;
     teams[teamId] = {
       teamId,
       memberCount,
-      capacity: TEAM_CAPACITY,
+      capacity,
       isFull,
       isOpened,
       openedAt: isOpened ? openedAt : null,
@@ -174,6 +194,7 @@ export function buildRoomPublicState(
   return {
     room,
     epoch: snapshot.epoch,
+    bonusTeamId: snapshot.bonusTeamId,
     totalPeopleAssigned,
     totalPeople: TOTAL_PEOPLE,
     isAllFull,
@@ -189,8 +210,9 @@ export function isValidRoomPublicState(data: unknown): data is RoomPublicState {
     (candidate.room !== 'live' && candidate.room !== 'demo') ||
     typeof candidate.epoch !== 'string' ||
     candidate.epoch.length === 0 ||
+    !isTeamId(candidate.bonusTeamId) ||
     typeof candidate.totalPeopleAssigned !== 'number' ||
-    typeof candidate.totalPeople !== 'number' ||
+    candidate.totalPeople !== TOTAL_PEOPLE ||
     typeof candidate.isAllFull !== 'boolean' ||
     !candidate.assignments ||
     typeof candidate.assignments !== 'object' ||
@@ -229,6 +251,7 @@ export function saveRemoteStateToLocal(room: RoomMode, state: RoomPublicState): 
   }
   writeLocalSnapshot(room, {
     epoch: state.epoch,
+    bonusTeamId: state.bonusTeamId,
     assignments: { ...state.assignments },
     assignmentOrder,
     openedBags,
@@ -250,7 +273,12 @@ export function spinLocalRoomState(
     };
   }
 
-  const chosenTeam = pickRandomEligibleTeam(snapshot.assignments, entryId, randomFloat);
+  const chosenTeam = pickRandomEligibleTeam(
+    snapshot.assignments,
+    entryId,
+    snapshot.bonusTeamId,
+    randomFloat
+  );
   snapshot.assignments[entryId] = chosenTeam;
   snapshot.assignmentOrder.push(entryId);
   writeLocalSnapshot(room, snapshot);
@@ -279,38 +307,30 @@ export function openLocalRoomBag(room: RoomMode, teamId: TeamId): RoomPublicStat
 }
 
 export function resetLocalRoomState(room: RoomMode): RoomPublicState {
-  const freshSnapshot = createDefaultSnapshot(createFreshLocalEpoch());
+  const freshSnapshot = createDefaultSnapshot(createFreshLocalEpoch(), pickRandomBonusTeamId());
   writeLocalSnapshot(room, freshSnapshot);
   return buildRoomPublicState(room, freshSnapshot);
 }
 
 export function autofillDemoLocalRoomState(keepEntryId?: string): RoomPublicState {
-  const snapshot = createDefaultSnapshot(createFreshLocalEpoch());
+  const snapshot = createDefaultSnapshot(createFreshLocalEpoch(), pickRandomBonusTeamId());
   for (const entry of GUEST_ENTRIES) {
     if (keepEntryId && entry.id === keepEntryId) {
       continue;
     }
-    try {
-      const team = pickRandomEligibleTeam(snapshot.assignments, entry.id);
-      snapshot.assignments[entry.id] = team;
-      snapshot.assignmentOrder.push(entry.id);
-    } catch {
-      break;
-    }
+    const team = pickRandomEligibleTeam(snapshot.assignments, entry.id, snapshot.bonusTeamId);
+    snapshot.assignments[entry.id] = team;
+    snapshot.assignmentOrder.push(entry.id);
   }
   if (keepEntryId && ENTRY_BY_ID.has(keepEntryId) && !snapshot.assignments[keepEntryId]) {
-    try {
-      const team = pickRandomEligibleTeam(snapshot.assignments, keepEntryId);
-      snapshot.assignments[keepEntryId] = team;
-      snapshot.assignmentOrder.push(keepEntryId);
-    } catch {
-      // ignore if full
-    }
+    const team = pickRandomEligibleTeam(
+      snapshot.assignments,
+      keepEntryId,
+      snapshot.bonusTeamId
+    );
+    snapshot.assignments[keepEntryId] = team;
+    snapshot.assignmentOrder.push(keepEntryId);
   }
-  writeLocalSnapshot(roomModeDemo(), snapshot);
+  writeLocalSnapshot('demo', snapshot);
   return buildRoomPublicState('demo', snapshot);
-}
-
-function roomModeDemo(): RoomMode {
-  return 'demo';
 }

@@ -1,16 +1,23 @@
 export type TeamId = 1 | 2 | 3 | 4;
 
 export const TEAM_IDS: readonly TeamId[] = [1, 2, 3, 4] as const;
-export const TEAM_CAPACITY = 5;
-export const TOTAL_PEOPLE = TEAM_IDS.length * TEAM_CAPACITY; // 20 max seats (5 per team)
+export const DEFAULT_TEAM_CAPACITY = 6;
+export const BONUS_TEAM_CAPACITY = 7;
+export const TOTAL_PEOPLE = 25; // 3 teams x 6 + 1 bonus team x 7 = 25
 
-export function getTeamCapacities(): Record<TeamId, number> {
+export function getTeamCapacities(bonusTeamId: TeamId): Record<TeamId, number> {
   return {
-    1: TEAM_CAPACITY,
-    2: TEAM_CAPACITY,
-    3: TEAM_CAPACITY,
-    4: TEAM_CAPACITY,
+    1: bonusTeamId === 1 ? BONUS_TEAM_CAPACITY : DEFAULT_TEAM_CAPACITY,
+    2: bonusTeamId === 2 ? BONUS_TEAM_CAPACITY : DEFAULT_TEAM_CAPACITY,
+    3: bonusTeamId === 3 ? BONUS_TEAM_CAPACITY : DEFAULT_TEAM_CAPACITY,
+    4: bonusTeamId === 4 ? BONUS_TEAM_CAPACITY : DEFAULT_TEAM_CAPACITY,
   };
+}
+
+export function pickRandomBonusTeamId(randomFloat: () => number = Math.random): TeamId {
+  const raw = randomFloat();
+  const clamped = Math.min(Math.max(raw, 0), 0.999999999);
+  return TEAM_IDS[Math.floor(clamped * TEAM_IDS.length)];
 }
 
 export interface GuestEntry {
@@ -101,6 +108,7 @@ export interface AssignmentRecord {
 export interface RoomPublicState {
   room: 'live' | 'demo';
   epoch: string;
+  bonusTeamId: TeamId;
   totalPeopleAssigned: number;
   totalPeople: number;
   isAllFull: boolean;
@@ -120,12 +128,14 @@ export function getTeamSeatCounts(assignments: Record<string, TeamId>): Record<T
 }
 
 /**
- * Computes all teams that still have capacity for `entryId` without ever
- * exceeding TEAM_CAPACITY (5 members per team). Any team at 5/5 is excluded.
+ * Computes all teams that can accept `entryId` under the 6+6+6+7 = 25 capacity rule.
+ * When assigning a single guest (`seats === 1`), uses pair-preserving lookahead so
+ * unassigned 2-seat pairs can never be stranded with only 1-seat holes remaining.
  */
 export function computeEligibleTeams(
   assignments: Record<string, TeamId>,
-  entryId: string
+  entryId: string,
+  bonusTeamId: TeamId = 4
 ): TeamId[] {
   const entry = ENTRY_BY_ID.get(entryId);
   if (!entry) {
@@ -135,26 +145,52 @@ export function computeEligibleTeams(
     return [assignments[entryId]];
   }
 
+  const capacities = getTeamCapacities(bonusTeamId);
   const used = getTeamSeatCounts(assignments);
-  const eligible: TeamId[] = [];
+  const directCandidates: TeamId[] = [];
+
   for (const teamId of TEAM_IDS) {
-    if (used[teamId] < TEAM_CAPACITY && used[teamId] + entry.seats <= TEAM_CAPACITY) {
-      eligible.push(teamId);
+    if (used[teamId] < capacities[teamId] && used[teamId] + entry.seats <= capacities[teamId]) {
+      directCandidates.push(teamId);
     }
   }
 
-  return eligible;
+  if (directCandidates.length <= 1 || entry.seats === 2) {
+    return directCandidates;
+  }
+
+  const remainingPairs = GUEST_ENTRIES.filter(
+    (g) => g.seats === 2 && g.id !== entryId && !assignments[g.id]
+  ).length;
+
+  if (remainingPairs === 0) {
+    return directCandidates;
+  }
+
+  const pairSafeCandidates = directCandidates.filter((candidateTeamId) => {
+    let availablePairSlotsAfter = 0;
+    for (const teamId of TEAM_IDS) {
+      const nextUsed = used[teamId] + (teamId === candidateTeamId ? 1 : 0);
+      const remainingSeats = Math.max(0, capacities[teamId] - nextUsed);
+      availablePairSlotsAfter += Math.floor(remainingSeats / 2);
+    }
+    return availablePairSlotsAfter >= remainingPairs;
+  });
+
+  return pairSafeCandidates.length > 0 ? pairSafeCandidates : directCandidates;
 }
 
 export function pickRandomEligibleTeam(
   assignments: Record<string, TeamId>,
   entryId: string,
+  bonusTeamId: TeamId = 4,
   randomFloat: () => number = Math.random
 ): TeamId {
-  const eligible = computeEligibleTeams(assignments, entryId);
+  const eligible = computeEligibleTeams(assignments, entryId, bonusTeamId);
   if (eligible.length === 0) {
+    const capacities = getTeamCapacities(bonusTeamId);
     const used = getTeamSeatCounts(assignments);
-    const allTeamsFull = TEAM_IDS.every((id) => used[id] >= TEAM_CAPACITY);
+    const allTeamsFull = TEAM_IDS.every((id) => used[id] >= capacities[id]);
     if (allTeamsFull) {
       throw new Error('Tất cả các đội đã đủ thành viên.');
     }
@@ -209,7 +245,7 @@ export function formatTeamsClipboardText(state: RoomPublicState): string {
   for (const teamId of TEAM_IDS) {
     const team = state.teams[teamId];
     const status = team.isFull
-      ? 'Đã đủ (5/5)'
+      ? `Đã đủ (${team.memberCount}/${team.capacity})`
       : `Chưa đủ (còn thiếu ${Math.max(0, team.capacity - team.memberCount)} người)`;
     const memberNames =
       team.members.length > 0 ? team.members.map((m) => m.memberName).join(', ') : 'Chưa có thành viên';

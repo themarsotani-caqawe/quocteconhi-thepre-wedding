@@ -5,9 +5,9 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   ENTRY_BY_ID,
   GUEST_ENTRIES,
-  TEAM_CAPACITY,
   TEAM_IDS,
   TOTAL_PEOPLE,
+  getTeamCapacities,
   pickRandomEligibleTeam,
   type RoomPublicState,
   type TeamId,
@@ -47,9 +47,18 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS room_epochs (
     room TEXT PRIMARY KEY,
     epoch TEXT NOT NULL,
+    bonus_team_id INTEGER NOT NULL DEFAULT 4 CHECK (bonus_team_id IN (1, 2, 3, 4)),
     updated_at TEXT NOT NULL
   );
 `);
+
+// Safely migrate older room_epochs tables created before bonus_team_id existed
+const epochColumns = db.prepare('PRAGMA table_info(room_epochs)').all() as Array<{ name: string }>;
+if (!epochColumns.some((col) => col.name === 'bonus_team_id')) {
+  db.exec(
+    'ALTER TABLE room_epochs ADD COLUMN bonus_team_id INTEGER NOT NULL DEFAULT 4 CHECK (bonus_team_id IN (1, 2, 3, 4))'
+  );
+}
 
 let mutationQueue: Promise<unknown> = Promise.resolve();
 function withWriteLock<T>(fn: () => T): Promise<T> {
@@ -58,35 +67,40 @@ function withWriteLock<T>(fn: () => T): Promise<T> {
   return next;
 }
 
-function getOrCreateRoomEpoch(room: RoomMode): string {
-  const existing = db
-    .prepare('SELECT epoch FROM room_epochs WHERE room = ?')
-    .get(room) as { epoch: string } | undefined;
-  if (existing) {
-    return existing.epoch;
-  }
-  const freshEpoch = crypto.randomUUID();
-  db.prepare('INSERT OR IGNORE INTO room_epochs (room, epoch, updated_at) VALUES (?, ?, ?)').run(
-    room,
-    freshEpoch,
-    new Date().toISOString()
-  );
-  const saved = db
-    .prepare('SELECT epoch FROM room_epochs WHERE room = ?')
-    .get(room) as { epoch: string };
-  return saved.epoch;
+function randomBonusTeamId(): TeamId {
+  return TEAM_IDS[crypto.randomInt(0, TEAM_IDS.length)];
 }
 
-function rotateRoomEpoch(room: RoomMode): string {
+function getOrCreateRoomMeta(room: RoomMode): { epoch: string; bonusTeamId: TeamId } {
+  const existing = db
+    .prepare('SELECT epoch, bonus_team_id FROM room_epochs WHERE room = ?')
+    .get(room) as { epoch: string; bonus_team_id: TeamId } | undefined;
+  if (existing) {
+    return { epoch: existing.epoch, bonusTeamId: existing.bonus_team_id };
+  }
   const freshEpoch = crypto.randomUUID();
+  const bonusTeamId = randomBonusTeamId();
+  db.prepare(
+    'INSERT OR IGNORE INTO room_epochs (room, epoch, bonus_team_id, updated_at) VALUES (?, ?, ?, ?)'
+  ).run(room, freshEpoch, bonusTeamId, new Date().toISOString());
+  const saved = db
+    .prepare('SELECT epoch, bonus_team_id FROM room_epochs WHERE room = ?')
+    .get(room) as { epoch: string; bonus_team_id: TeamId };
+  return { epoch: saved.epoch, bonusTeamId: saved.bonus_team_id };
+}
+
+function rotateRoomEpoch(room: RoomMode): { epoch: string; bonusTeamId: TeamId } {
+  const freshEpoch = crypto.randomUUID();
+  const bonusTeamId = randomBonusTeamId();
   db.prepare(`
-    INSERT INTO room_epochs (room, epoch, updated_at)
-    VALUES (?, ?, ?)
+    INSERT INTO room_epochs (room, epoch, bonus_team_id, updated_at)
+    VALUES (?, ?, ?, ?)
     ON CONFLICT(room) DO UPDATE SET
       epoch = excluded.epoch,
+      bonus_team_id = excluded.bonus_team_id,
       updated_at = excluded.updated_at
-  `).run(room, freshEpoch, new Date().toISOString());
-  return freshEpoch;
+  `).run(room, freshEpoch, bonusTeamId, new Date().toISOString());
+  return { epoch: freshEpoch, bonusTeamId };
 }
 
 function readAssignmentsMap(room: RoomMode): {
@@ -105,7 +119,8 @@ function readAssignmentsMap(room: RoomMode): {
 }
 
 export function getPublicRoomState(room: RoomMode): RoomPublicState {
-  const epoch = getOrCreateRoomEpoch(room);
+  const { epoch, bonusTeamId } = getOrCreateRoomMeta(room);
+  const capacities = getTeamCapacities(bonusTeamId);
   const { orderedRows, assignments } = readAssignmentsMap(room);
   const bagStmt = db.prepare(
     'SELECT team_id, opened, opened_at FROM team_bags WHERE room = ?'
@@ -142,13 +157,14 @@ export function getPublicRoomState(room: RoomMode): RoomPublicState {
   for (const teamId of TEAM_IDS) {
     const members = teamMembers[teamId];
     const memberCount = members.length;
-    const isFull = memberCount >= TEAM_CAPACITY;
+    const capacity = capacities[teamId];
+    const isFull = memberCount >= capacity;
     const bagMeta = bagMap.get(teamId);
     const isOpened = Boolean(bagMeta?.opened) && isFull;
     teams[teamId] = {
       teamId,
       memberCount,
-      capacity: TEAM_CAPACITY,
+      capacity,
       isFull,
       isOpened,
       openedAt: isOpened ? (bagMeta?.openedAt ?? null) : null,
@@ -162,6 +178,7 @@ export function getPublicRoomState(room: RoomMode): RoomPublicState {
   return {
     room,
     epoch,
+    bonusTeamId,
     totalPeopleAssigned,
     totalPeople: TOTAL_PEOPLE,
     isAllFull,
@@ -199,10 +216,12 @@ export function spinEntryAtomic(room: RoomMode, entryId: string): Promise<SpinRe
         };
       }
 
+      const { bonusTeamId } = getOrCreateRoomMeta(room);
       const { assignments } = readAssignmentsMap(room);
       const teamId = pickRandomEligibleTeam(
         assignments,
         entryId,
+        bonusTeamId,
         () => crypto.randomInt(0, 1_000_000) / 1_000_000
       );
 
@@ -242,6 +261,8 @@ export function openBagAtomic(
   return withWriteLock(() => {
     db.exec('BEGIN IMMEDIATE');
     try {
+      const { bonusTeamId } = getOrCreateRoomMeta(room);
+      const capacity = getTeamCapacities(bonusTeamId)[teamId];
       const { assignments } = readAssignmentsMap(room);
       let teamSeatCount = 0;
       for (const [entryId, assignedTeam] of Object.entries(assignments)) {
@@ -250,11 +271,11 @@ export function openBagAtomic(
         }
       }
 
-      if (teamSeatCount < TEAM_CAPACITY) {
+      if (teamSeatCount < capacity) {
         db.exec('ROLLBACK');
         return {
           ok: false,
-          error: `Đội ${teamId} hiện có ${teamSeatCount}/${TEAM_CAPACITY} thành viên, chưa thể khui túi mù.`,
+          error: `Đội ${teamId} hiện có ${teamSeatCount}/${capacity} thành viên, chưa thể khui túi mù.`,
           state: getPublicRoomState(room),
         };
       }
@@ -326,43 +347,34 @@ export function autofillDemoExceptOneAtomic(keepEntryId?: string): Promise<RoomP
   return withWriteLock(() => {
     db.exec('BEGIN IMMEDIATE');
     try {
+      const { bonusTeamId } = getOrCreateRoomMeta('demo');
       const { assignments } = readAssignmentsMap('demo');
-      const singlesFirst = GUEST_ENTRIES.filter(
-        (entry) => entry.id !== keepEntryId && entry.seats === 1 && assignments[entry.id] === undefined
+      const remainingGuests = GUEST_ENTRIES.filter(
+        (entry) => entry.id !== keepEntryId && assignments[entry.id] === undefined
       );
-      const pairsNext = GUEST_ENTRIES.filter(
-        (entry) => entry.id !== keepEntryId && entry.seats === 2 && assignments[entry.id] === undefined
-      );
-      for (const entry of [...pairsNext, ...singlesFirst]) {
+      for (const entry of remainingGuests) {
         const current = readAssignmentsMap('demo').assignments;
-        try {
-          const teamId = pickRandomEligibleTeam(
-            current,
-            entry.id,
-            () => crypto.randomInt(0, 1_000_000) / 1_000_000
-          );
-          db.prepare(
-            'INSERT INTO assignments (room, entry_id, team_id, created_at) VALUES (?, ?, ?, ?)'
-          ).run('demo', entry.id, teamId, new Date().toISOString());
-        } catch {
-          // stop once 20 seats (5 per team) are filled
-          break;
-        }
+        const teamId = pickRandomEligibleTeam(
+          current,
+          entry.id,
+          bonusTeamId,
+          () => crypto.randomInt(0, 1_000_000) / 1_000_000
+        );
+        db.prepare(
+          'INSERT INTO assignments (room, entry_id, team_id, created_at) VALUES (?, ?, ?, ?)'
+        ).run('demo', entry.id, teamId, new Date().toISOString());
       }
       if (keepEntryId && readAssignmentsMap('demo').assignments[keepEntryId] === undefined) {
         const current = readAssignmentsMap('demo').assignments;
-        try {
-          const teamId = pickRandomEligibleTeam(
-            current,
-            keepEntryId,
-            () => crypto.randomInt(0, 1_000_000) / 1_000_000
-          );
-          db.prepare(
-            'INSERT INTO assignments (room, entry_id, team_id, created_at) VALUES (?, ?, ?, ?)'
-          ).run('demo', keepEntryId, teamId, new Date().toISOString());
-        } catch {
-          // already 20/20
-        }
+        const teamId = pickRandomEligibleTeam(
+          current,
+          keepEntryId,
+          bonusTeamId,
+          () => crypto.randomInt(0, 1_000_000) / 1_000_000
+        );
+        db.prepare(
+          'INSERT INTO assignments (room, entry_id, team_id, created_at) VALUES (?, ?, ?, ?)'
+        ).run('demo', keepEntryId, teamId, new Date().toISOString());
       }
       db.exec('COMMIT');
       return getPublicRoomState('demo');
