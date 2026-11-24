@@ -13,6 +13,14 @@ import { OwnerDashboard } from '../components/OwnerDashboard';
 import { PremiereMarqueeHeader } from '../components/PremiereMarqueeHeader';
 import { PrizeWheel } from '../components/PrizeWheel';
 import { TeamView } from '../components/TeamView';
+import { TeamsOverviewCard } from '../components/TeamsOverviewCard';
+import {
+  autofillDemoCloudRoomState,
+  fetchCloudRoomState,
+  openCloudRoomBag,
+  resetCloudRoomState,
+  spinCloudRoomState,
+} from '../lib/cloudRoomSync';
 import {
   clearDeviceSpinLock,
   readDeviceSpinLock,
@@ -37,6 +45,8 @@ import {
 } from '../shared/premiereRules';
 
 const REMOTE_TIMEOUT_MS = 2200;
+
+type SyncBackend = 'probing' | 'express' | 'cloud' | 'local';
 
 function getRoomFromSearch(): 'live' | 'demo' {
   const params = new URLSearchParams(window.location.search);
@@ -76,7 +86,7 @@ export function PremiereEventPage() {
   const isOwner = useMemo(() => getIsOwnerFromSearch(), []);
 
   // Always initialize synchronously from browser-local state so UI is immediately usable
-  // without ever blocking on external shared sync.
+  // without ever showing a blocking reconnect banner.
   const [roomState, setRoomState] = useState<RoomPublicState>(() => readLocalRoomState(room));
 
   // Strict per-device lock stored in BOTH localStorage & cookie
@@ -104,8 +114,7 @@ export function PremiereEventPage() {
   const [openError, setOpenError] = useState<string | null>(null);
   const openBagTimerRef = useRef<number | null>(null);
 
-  // Track whether optional backend API is genuinely reachable (null = probing, true = active, false = local mode)
-  const remoteAvailableRef = useRef<boolean | null>(null);
+  const syncBackendRef = useRef<SyncBackend>('probing');
 
   const reconcileLockWithState = useCallback(
     (nextState: RoomPublicState) => {
@@ -136,26 +145,42 @@ export function PremiereEventPage() {
     [reconcileLockWithState, room]
   );
 
-  const fetchLatestState = useCallback(async (): Promise<boolean> => {
-    try {
-      const { ok, data } = await fetchJsonWithTimeout(`/api/state?room=${room}`, {
-        cache: 'no-store',
-      });
-      if (!ok || !isValidRoomPublicState(data)) {
-        remoteAvailableRef.current = false;
-        return false;
+  const fetchLatestState = useCallback(async (): Promise<SyncBackend> => {
+    // 1. Try Express /api/state when probing or already using Express
+    if (syncBackendRef.current === 'probing' || syncBackendRef.current === 'express') {
+      try {
+        const { ok, data } = await fetchJsonWithTimeout(`/api/state?room=${room}`, {
+          cache: 'no-store',
+        });
+        if (ok && isValidRoomPublicState(data)) {
+          syncBackendRef.current = 'express';
+          applyRemoteState(data);
+          return 'express';
+        }
+      } catch {
+        // Not running Express backend (e.g. static Vercel deploy) -> fall through to shared cloud sync
       }
-      remoteAvailableRef.current = true;
-      applyRemoteState(data);
-      return true;
-    } catch {
-      // Silently ignore external sync errors/timeouts and keep running in browser-local mode
-      remoteAvailableRef.current = false;
-      return false;
     }
+
+    // 2. Try shared CORS cloud JSON sync so all phones share team rosters on Vercel/static hosting
+    if (syncBackendRef.current !== 'local') {
+      try {
+        const cloudState = await fetchCloudRoomState(room);
+        syncBackendRef.current = 'cloud';
+        applyRemoteState(cloudState);
+        return 'cloud';
+      } catch {
+        // Silently ignore if cloud sync is offline/unreachable
+      }
+    }
+
+    if (syncBackendRef.current === 'probing') {
+      syncBackendRef.current = 'local';
+    }
+    return syncBackendRef.current;
   }, [applyRemoteState, room]);
 
-  // Optional real-time SSE + periodic sync only when backend API responds cleanly
+  // Real-time sync across phones: SSE when Express is active, 5s polling when Express or Cloud is active
   useEffect(() => {
     let source: EventSource | null = null;
     let pollInterval: number | null = null;
@@ -163,7 +188,7 @@ export function PremiereEventPage() {
     let closed = false;
 
     const connectSse = () => {
-      if (closed || remoteAvailableRef.current !== true || source) return;
+      if (closed || syncBackendRef.current !== 'express' || source) return;
       source = new EventSource(`/api/events?room=${room}`);
       source.addEventListener('state', (event) => {
         try {
@@ -178,38 +203,47 @@ export function PremiereEventPage() {
       source.onerror = () => {
         source?.close();
         source = null;
-        if (!closed && remoteAvailableRef.current === true && reconnectTimer === null) {
+        if (!closed && syncBackendRef.current === 'express' && reconnectTimer === null) {
           reconnectTimer = window.setTimeout(() => {
             reconnectTimer = null;
-            void fetchLatestState().then((ok) => {
-              if (ok) connectSse();
+            void fetchLatestState().then((mode) => {
+              if (mode === 'express') connectSse();
             });
           }, 5000);
         }
       };
     };
 
-    void fetchLatestState().then((ok) => {
-      if (closed || !ok) return;
-      connectSse();
+    void fetchLatestState().then((mode) => {
+      if (closed || mode === 'local') return;
+      if (mode === 'express') {
+        connectSse();
+      }
       pollInterval = window.setInterval(() => {
-        if (document.visibilityState === 'visible' && remoteAvailableRef.current === true) {
+        if (
+          document.visibilityState === 'visible' &&
+          (syncBackendRef.current === 'express' || syncBackendRef.current === 'cloud')
+        ) {
           void fetchLatestState();
         }
       }, 5000);
     });
 
     const handleVisibility = () => {
-      if (document.visibilityState === 'visible' && remoteAvailableRef.current === true) {
+      if (
+        document.visibilityState === 'visible' &&
+        (syncBackendRef.current === 'express' || syncBackendRef.current === 'cloud')
+      ) {
         void fetchLatestState();
       }
     };
     const handleOnline = () => {
-      if (remoteAvailableRef.current !== false) {
-        void fetchLatestState().then((ok) => {
-          if (ok) connectSse();
-        });
+      if (syncBackendRef.current === 'local') {
+        syncBackendRef.current = 'probing';
       }
+      void fetchLatestState().then((mode) => {
+        if (mode === 'express') connectSse();
+      });
     };
 
     document.addEventListener('visibilitychange', handleVisibility);
@@ -242,7 +276,7 @@ export function PremiereEventPage() {
   );
 
   // Spin button is strictly locked unless:
-  // - all 4 teams are NOT 5/5 full
+  // - all 4 teams are NOT full
   // - this device has NOT already spun
   // - guest has explicitly selected an unassigned name from dropdown
   // - wheel is not currently spinning
@@ -302,8 +336,8 @@ export function PremiereEventPage() {
 
     setIsSpinning(true);
 
-    // If backend API is confirmed reachable, try shared spin first; otherwise or on error/timeout, spin locally immediately
-    if (remoteAvailableRef.current === true) {
+    // 1. Try Express backend if active
+    if (syncBackendRef.current === 'express') {
       try {
         const { status, ok, data } = await fetchJsonWithTimeout('/api/spin', {
           method: 'POST',
@@ -337,11 +371,38 @@ export function PremiereEventPage() {
           return;
         }
       } catch {
-        // Fall through to local spin if remote server failed or timed out
-        remoteAvailableRef.current = false;
+        syncBackendRef.current = 'cloud';
       }
     }
 
+    // 2. Try shared cloud JSON store (works on Vercel / GitHub static hosting)
+    if (syncBackendRef.current === 'cloud' || syncBackendRef.current === 'probing') {
+      try {
+        const cloudResult = await spinCloudRoomState(room, selectedEntryId);
+        syncBackendRef.current = 'cloud';
+        if (cloudResult.alreadyAssigned) {
+          setRoomState(cloudResult.state);
+          setIsSpinning(false);
+          setSpinError('Tên này vừa được quay ở một thiết bị khác. Hãy chọn lại tên của bạn.');
+          setSelectedEntryId(null);
+          return;
+        }
+        commitWheelSpinResult(selectedEntryId, cloudResult.teamId, cloudResult.state);
+        return;
+      } catch (err) {
+        if (
+          err instanceof Error &&
+          (err.message.includes('đủ thành viên') || err.message.includes('chỗ trống'))
+        ) {
+          setIsSpinning(false);
+          setSpinError(err.message);
+          return;
+        }
+        // Fall through to local browser spin
+      }
+    }
+
+    // 3. Offline / local browser fallback
     try {
       const localResult = spinLocalRoomState(room, selectedEntryId);
       if (localResult.alreadyAssigned) {
@@ -365,7 +426,7 @@ export function PremiereEventPage() {
     setOpenError(null);
     setIsOpeningBag(true);
 
-    if (remoteAvailableRef.current === true) {
+    if (syncBackendRef.current === 'express') {
       try {
         const { ok, status, data } = await fetchJsonWithTimeout('/api/open-bag', {
           method: 'POST',
@@ -398,7 +459,25 @@ export function PremiereEventPage() {
           return;
         }
       } catch {
-        remoteAvailableRef.current = false;
+        syncBackendRef.current = 'cloud';
+      }
+    }
+
+    if (syncBackendRef.current === 'cloud' || syncBackendRef.current === 'probing') {
+      try {
+        const nextState = await openCloudRoomBag(room, assignedTeamId);
+        syncBackendRef.current = 'cloud';
+        openBagTimerRef.current = window.setTimeout(() => {
+          setRoomState(nextState);
+          setIsOpeningBag(false);
+        }, 450);
+        return;
+      } catch (err) {
+        if (err instanceof Error && err.message.includes('cần đủ')) {
+          setIsOpeningBag(false);
+          setOpenError(err.message);
+          return;
+        }
       }
     }
 
@@ -426,7 +505,7 @@ export function PremiereEventPage() {
   };
 
   const handleOwnerReset = async () => {
-    if (remoteAvailableRef.current === true) {
+    if (syncBackendRef.current === 'express') {
       try {
         const { ok, data } = await fetchJsonWithTimeout('/api/reset', {
           method: 'POST',
@@ -440,7 +519,18 @@ export function PremiereEventPage() {
           return;
         }
       } catch {
-        remoteAvailableRef.current = false;
+        syncBackendRef.current = 'cloud';
+      }
+    }
+
+    if (syncBackendRef.current === 'cloud' || syncBackendRef.current === 'probing') {
+      try {
+        const nextState = await resetCloudRoomState(room);
+        syncBackendRef.current = 'cloud';
+        applyResetSuccess(nextState, room);
+        return;
+      } catch {
+        // fall through to local reset
       }
     }
 
@@ -452,7 +542,7 @@ export function PremiereEventPage() {
     const targetEntry = selectedEntryId || 'celine-phang';
     let nextState: RoomPublicState | null = null;
 
-    if (remoteAvailableRef.current === true) {
+    if (syncBackendRef.current === 'express') {
       try {
         const { ok, data } = await fetchJsonWithTimeout('/api/demo/autofill', {
           method: 'POST',
@@ -465,7 +555,16 @@ export function PremiereEventPage() {
           saveRemoteStateToLocal('demo', nextState);
         }
       } catch {
-        remoteAvailableRef.current = false;
+        syncBackendRef.current = 'cloud';
+      }
+    }
+
+    if (!nextState && (syncBackendRef.current === 'cloud' || syncBackendRef.current === 'probing')) {
+      try {
+        nextState = await autofillDemoCloudRoomState(targetEntry);
+        syncBackendRef.current = 'cloud';
+      } catch {
+        // fall through to local autofill
       }
     }
 
@@ -489,7 +588,7 @@ export function PremiereEventPage() {
   };
 
   const handleDemoReset = async () => {
-    if (remoteAvailableRef.current === true) {
+    if (syncBackendRef.current === 'express') {
       try {
         const { ok, data } = await fetchJsonWithTimeout('/api/reset', {
           method: 'POST',
@@ -503,7 +602,18 @@ export function PremiereEventPage() {
           return;
         }
       } catch {
-        remoteAvailableRef.current = false;
+        syncBackendRef.current = 'cloud';
+      }
+    }
+
+    if (syncBackendRef.current === 'cloud' || syncBackendRef.current === 'probing') {
+      try {
+        const nextState = await resetCloudRoomState('demo');
+        syncBackendRef.current = 'cloud';
+        applyResetSuccess(nextState, 'demo');
+        return;
+      } catch {
+        // fall through
       }
     }
 
@@ -703,9 +813,15 @@ export function PremiereEventPage() {
             </motion.div>
           )}
 
-          {/* Owner Dashboard rendered right below the wheel / team card when ?owner=true */}
-          {isOwner && (
+          {/* Owner Dashboard when ?owner=true, or live 4-team roster overview for all guests */}
+          {isOwner ? (
             <OwnerDashboard roomState={roomState} onResetAll={handleOwnerReset} />
+          ) : (
+            <TeamsOverviewCard
+              roomState={roomState}
+              highlightEntryId={effectiveEntryId}
+              highlightTeamId={assignedTeamId}
+            />
           )}
         </div>
       )}
