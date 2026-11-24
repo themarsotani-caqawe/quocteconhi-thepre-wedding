@@ -100,10 +100,10 @@ export function CarnivalButton({
       {...rest}
     >
       <span className="pointer-events-none absolute inset-[3px] rounded-full border border-dashed border-[#6d1d36]/55" />
-      <span className="relative z-10 flex items-center justify-center gap-2.5 font-display font-bold text-[20px] leading-none whitespace-nowrap">
-        <GoldStar className="w-4 h-4" />
+      <span className="relative z-10 flex items-center justify-center gap-2 font-display font-bold text-[19px] leading-tight text-center">
+        <GoldStar className="w-4 h-4 shrink-0" />
         <span>{children}</span>
-        <GoldStar className="w-4 h-4" />
+        <GoldStar className="w-4 h-4 shrink-0" />
       </span>
     </button>
   );

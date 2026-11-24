@@ -5,10 +5,9 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   ENTRY_BY_ID,
   GUEST_ENTRIES,
+  TEAM_CAPACITY,
   TEAM_IDS,
   TOTAL_PEOPLE,
-  getTeamCapacities,
-  getTeamSeatCounts,
   pickRandomEligibleTeam,
   type RoomPublicState,
   type TeamId,
@@ -45,27 +44,49 @@ db.exec(`
     PRIMARY KEY (room, team_id)
   );
 
-  CREATE TABLE IF NOT EXISTS room_settings (
+  CREATE TABLE IF NOT EXISTS room_epochs (
     room TEXT PRIMARY KEY,
-    bonus_team_id INTEGER NOT NULL CHECK (bonus_team_id IN (1, 2, 3, 4))
-  );
-
-  CREATE TABLE IF NOT EXISTS sheet_links (
-    id TEXT PRIMARY KEY,
-    spreadsheet_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    url TEXT NOT NULL,
+    epoch TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
 `);
 
-// Serialize mutations through a per-process promise queue + SQLite BEGIN IMMEDIATE
-// so concurrent HTTP requests never race or double-assign an entry.
 let mutationQueue: Promise<unknown> = Promise.resolve();
 function withWriteLock<T>(fn: () => T): Promise<T> {
   const next = mutationQueue.then(() => fn(), () => fn());
   mutationQueue = next.catch(() => {});
   return next;
+}
+
+function getOrCreateRoomEpoch(room: RoomMode): string {
+  const existing = db
+    .prepare('SELECT epoch FROM room_epochs WHERE room = ?')
+    .get(room) as { epoch: string } | undefined;
+  if (existing) {
+    return existing.epoch;
+  }
+  const freshEpoch = crypto.randomUUID();
+  db.prepare('INSERT OR IGNORE INTO room_epochs (room, epoch, updated_at) VALUES (?, ?, ?)').run(
+    room,
+    freshEpoch,
+    new Date().toISOString()
+  );
+  const saved = db
+    .prepare('SELECT epoch FROM room_epochs WHERE room = ?')
+    .get(room) as { epoch: string };
+  return saved.epoch;
+}
+
+function rotateRoomEpoch(room: RoomMode): string {
+  const freshEpoch = crypto.randomUUID();
+  db.prepare(`
+    INSERT INTO room_epochs (room, epoch, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(room) DO UPDATE SET
+      epoch = excluded.epoch,
+      updated_at = excluded.updated_at
+  `).run(room, freshEpoch, new Date().toISOString());
+  return freshEpoch;
 }
 
 function readAssignmentsMap(room: RoomMode): {
@@ -83,44 +104,8 @@ function readAssignmentsMap(room: RoomMode): {
   return { assignments, orderedRows: rows };
 }
 
-function getOrCreateBonusTeamId(room: RoomMode): TeamId {
-  const existing = db
-    .prepare('SELECT bonus_team_id FROM room_settings WHERE room = ?')
-    .get(room) as { bonus_team_id: TeamId } | undefined;
-  if (existing) {
-    return existing.bonus_team_id;
-  }
-
-  const { assignments } = readAssignmentsMap(room);
-  const used = getTeamSeatCounts(assignments);
-  const remainingPairs = GUEST_ENTRIES.filter(
-    (entry) => entry.seats === 2 && assignments[entry.id] === undefined
-  ).length;
-
-  const validCandidates = TEAM_IDS.filter((candidateBonus) => {
-    const caps = getTeamCapacities(candidateBonus);
-    const fitsExisting = TEAM_IDS.every((t) => used[t] <= caps[t]);
-    if (!fitsExisting) return false;
-    const blocks = TEAM_IDS.reduce((sum, t) => sum + Math.floor((caps[t] - used[t]) / 2), 0);
-    return blocks >= remainingPairs;
-  });
-
-  const pool = validCandidates.length > 0 ? validCandidates : TEAM_IDS;
-  const chosen = pool[crypto.randomInt(0, pool.length)];
-
-  db.prepare('INSERT OR IGNORE INTO room_settings (room, bonus_team_id) VALUES (?, ?)').run(
-    room,
-    chosen
-  );
-  const saved = db
-    .prepare('SELECT bonus_team_id FROM room_settings WHERE room = ?')
-    .get(room) as { bonus_team_id: TeamId };
-  return saved.bonus_team_id;
-}
-
 export function getPublicRoomState(room: RoomMode): RoomPublicState {
-  const bonusTeamId = getOrCreateBonusTeamId(room);
-  const capacities = getTeamCapacities(bonusTeamId);
+  const epoch = getOrCreateRoomEpoch(room);
   const { orderedRows, assignments } = readAssignmentsMap(room);
   const bagStmt = db.prepare(
     'SELECT team_id, opened, opened_at FROM team_bags WHERE room = ?'
@@ -157,14 +142,13 @@ export function getPublicRoomState(room: RoomMode): RoomPublicState {
   for (const teamId of TEAM_IDS) {
     const members = teamMembers[teamId];
     const memberCount = members.length;
-    const capacity = capacities[teamId];
-    const isFull = memberCount >= capacity;
+    const isFull = memberCount >= TEAM_CAPACITY;
     const bagMeta = bagMap.get(teamId);
     const isOpened = Boolean(bagMeta?.opened) && isFull;
     teams[teamId] = {
       teamId,
       memberCount,
-      capacity,
+      capacity: TEAM_CAPACITY,
       isFull,
       isOpened,
       openedAt: isOpened ? (bagMeta?.openedAt ?? null) : null,
@@ -173,10 +157,14 @@ export function getPublicRoomState(room: RoomMode): RoomPublicState {
     };
   }
 
+  const isAllFull = TEAM_IDS.every((teamId) => teams[teamId].isFull);
+
   return {
     room,
+    epoch,
     totalPeopleAssigned,
     totalPeople: TOTAL_PEOPLE,
+    isAllFull,
     assignments,
     teams,
   };
@@ -211,19 +199,16 @@ export function spinEntryAtomic(room: RoomMode, entryId: string): Promise<SpinRe
         };
       }
 
-      const bonusTeamId = getOrCreateBonusTeamId(room);
       const { assignments } = readAssignmentsMap(room);
       const teamId = pickRandomEligibleTeam(
         assignments,
         entryId,
-        () => crypto.randomInt(0, 1_000_000) / 1_000_000,
-        bonusTeamId
+        () => crypto.randomInt(0, 1_000_000) / 1_000_000
       );
 
-      const insertStmt = db.prepare(
+      db.prepare(
         'INSERT INTO assignments (room, entry_id, team_id, created_at) VALUES (?, ?, ?, ?)'
-      );
-      insertStmt.run(room, entryId, teamId, new Date().toISOString());
+      ).run(room, entryId, teamId, new Date().toISOString());
       db.exec('COMMIT');
 
       return {
@@ -257,8 +242,6 @@ export function openBagAtomic(
   return withWriteLock(() => {
     db.exec('BEGIN IMMEDIATE');
     try {
-      const bonusTeamId = getOrCreateBonusTeamId(room);
-      const capacity = getTeamCapacities(bonusTeamId)[teamId];
       const { assignments } = readAssignmentsMap(room);
       let teamSeatCount = 0;
       for (const [entryId, assignedTeam] of Object.entries(assignments)) {
@@ -267,19 +250,18 @@ export function openBagAtomic(
         }
       }
 
-      if (teamSeatCount < capacity) {
+      if (teamSeatCount < TEAM_CAPACITY) {
         db.exec('ROLLBACK');
         return {
           ok: false,
-          error: `Đội ${teamId} hiện có ${teamSeatCount}/${capacity} thành viên, chưa thể khui túi mù.`,
+          error: `Đội ${teamId} hiện có ${teamSeatCount}/${TEAM_CAPACITY} thành viên, chưa thể khui túi mù.`,
           state: getPublicRoomState(room),
         };
       }
 
-      const existingBagStmt = db.prepare(
-        'SELECT opened FROM team_bags WHERE room = ? AND team_id = ?'
-      );
-      const existingBag = existingBagStmt.get(room, teamId) as { opened: number } | undefined;
+      const existingBag = db
+        .prepare('SELECT opened FROM team_bags WHERE room = ? AND team_id = ?')
+        .get(room, teamId) as { opened: number } | undefined;
 
       if (existingBag && existingBag.opened === 1) {
         db.exec('COMMIT');
@@ -290,15 +272,14 @@ export function openBagAtomic(
         };
       }
 
-      const upsertStmt = db.prepare(`
+      db.prepare(`
         INSERT INTO team_bags (room, team_id, opened, opened_at, opened_by)
         VALUES (?, ?, 1, ?, ?)
         ON CONFLICT(room, team_id) DO UPDATE SET
           opened = 1,
           opened_at = excluded.opened_at,
           opened_by = excluded.opened_by
-      `);
-      upsertStmt.run(room, teamId, new Date().toISOString(), openedByEntryId ?? null);
+      `).run(room, teamId, new Date().toISOString(), openedByEntryId ?? null);
       db.exec('COMMIT');
 
       return {
@@ -317,129 +298,71 @@ export function openBagAtomic(
   });
 }
 
+export function resetRoomAtomic(room: RoomMode): Promise<RoomPublicState> {
+  return withWriteLock(() => {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare('DELETE FROM assignments WHERE room = ?').run(room);
+      db.prepare('DELETE FROM team_bags WHERE room = ?').run(room);
+      rotateRoomEpoch(room);
+      db.exec('COMMIT');
+      return getPublicRoomState(room);
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  });
+}
+
 export function resetDemoRoomAtomic(): Promise<RoomPublicState> {
-  return withWriteLock(() => {
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      db.prepare('DELETE FROM assignments WHERE room = ?').run('demo');
-      db.prepare('DELETE FROM team_bags WHERE room = ?').run('demo');
-      db.prepare('DELETE FROM room_settings WHERE room = ?').run('demo');
-      db.exec('COMMIT');
-      return getPublicRoomState('demo');
-    } catch (err) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {
-        // ignore
-      }
-      throw err;
-    }
-  });
+  return resetRoomAtomic('demo');
 }
 
-export function resetLiveRoomAtomic(): Promise<RoomPublicState> {
-  return withWriteLock(() => {
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      db.prepare('DELETE FROM assignments WHERE room = ?').run('live');
-      db.prepare('DELETE FROM team_bags WHERE room = ?').run('live');
-      db.prepare('DELETE FROM room_settings WHERE room = ?').run('live');
-      db.exec('COMMIT');
-      return getPublicRoomState('live');
-    } catch (err) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {
-        // ignore
-      }
-      throw err;
-    }
-  });
-}
-
-export interface LinkedSheetRecord {
-  spreadsheetId: string;
-  title: string;
-  url: string;
-  updatedAt: string;
-}
-
-export function getLinkedSheet(): LinkedSheetRecord | null {
-  const row = db
-    .prepare('SELECT spreadsheet_id, title, url, updated_at FROM sheet_links WHERE id = ?')
-    .get('primary') as
-    | { spreadsheet_id: string; title: string; url: string; updated_at: string }
-    | undefined;
-  if (!row) return null;
-  return {
-    spreadsheetId: row.spreadsheet_id,
-    title: row.title,
-    url: row.url,
-    updatedAt: row.updated_at,
-  };
-}
-
-export function saveLinkedSheet(input: {
-  spreadsheetId: string;
-  title: string;
-  url: string;
-}): Promise<LinkedSheetRecord> {
-  return withWriteLock(() => {
-    const updatedAt = new Date().toISOString();
-    db.prepare(`
-      INSERT INTO sheet_links (id, spreadsheet_id, title, url, updated_at)
-      VALUES ('primary', ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        spreadsheet_id = excluded.spreadsheet_id,
-        title = excluded.title,
-        url = excluded.url,
-        updated_at = excluded.updated_at
-    `).run(input.spreadsheetId, input.title, input.url, updatedAt);
-    return {
-      spreadsheetId: input.spreadsheetId,
-      title: input.title,
-      url: input.url,
-      updatedAt,
-    };
-  });
-}
-
-/**
- * Demo-only helper: simulates other guests spinning so the host can test
- * partial team and full team -> Khui túi mù in sandbox mode.
- */
 export function autofillDemoExceptOneAtomic(keepEntryId?: string): Promise<RoomPublicState> {
   return withWriteLock(() => {
     db.exec('BEGIN IMMEDIATE');
     try {
-      const bonusTeamId = getOrCreateBonusTeamId('demo');
       const { assignments } = readAssignmentsMap('demo');
-      const candidates = GUEST_ENTRIES.filter(
-        (entry) => entry.id !== keepEntryId && assignments[entry.id] === undefined
+      const singlesFirst = GUEST_ENTRIES.filter(
+        (entry) => entry.id !== keepEntryId && entry.seats === 1 && assignments[entry.id] === undefined
       );
-      for (const entry of candidates) {
+      const pairsNext = GUEST_ENTRIES.filter(
+        (entry) => entry.id !== keepEntryId && entry.seats === 2 && assignments[entry.id] === undefined
+      );
+      for (const entry of [...pairsNext, ...singlesFirst]) {
         const current = readAssignmentsMap('demo').assignments;
-        const teamId = pickRandomEligibleTeam(
-          current,
-          entry.id,
-          () => crypto.randomInt(0, 1_000_000) / 1_000_000,
-          bonusTeamId
-        );
-        db.prepare(
-          'INSERT INTO assignments (room, entry_id, team_id, created_at) VALUES (?, ?, ?, ?)'
-        ).run('demo', entry.id, teamId, new Date().toISOString());
+        try {
+          const teamId = pickRandomEligibleTeam(
+            current,
+            entry.id,
+            () => crypto.randomInt(0, 1_000_000) / 1_000_000
+          );
+          db.prepare(
+            'INSERT INTO assignments (room, entry_id, team_id, created_at) VALUES (?, ?, ?, ?)'
+          ).run('demo', entry.id, teamId, new Date().toISOString());
+        } catch {
+          // stop once 20 seats (5 per team) are filled
+          break;
+        }
       }
       if (keepEntryId && readAssignmentsMap('demo').assignments[keepEntryId] === undefined) {
         const current = readAssignmentsMap('demo').assignments;
-        const teamId = pickRandomEligibleTeam(
-          current,
-          keepEntryId,
-          () => crypto.randomInt(0, 1_000_000) / 1_000_000,
-          bonusTeamId
-        );
-        db.prepare(
-          'INSERT INTO assignments (room, entry_id, team_id, created_at) VALUES (?, ?, ?, ?)'
-        ).run('demo', keepEntryId, teamId, new Date().toISOString());
+        try {
+          const teamId = pickRandomEligibleTeam(
+            current,
+            keepEntryId,
+            () => crypto.randomInt(0, 1_000_000) / 1_000_000
+          );
+          db.prepare(
+            'INSERT INTO assignments (room, entry_id, team_id, created_at) VALUES (?, ?, ?, ?)'
+          ).run('demo', keepEntryId, teamId, new Date().toISOString());
+        } catch {
+          // already 20/20
+        }
       }
       db.exec('COMMIT');
       return getPublicRoomState('demo');

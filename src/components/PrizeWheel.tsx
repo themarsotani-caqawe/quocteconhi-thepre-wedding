@@ -53,7 +53,9 @@ export function PrizeWheel({
         disabled={disabled || isSpinning}
         aria-label="Chạm vào vòng quay để quay tìm đội"
         data-testid="prize-wheel-button"
-        className="relative z-10 w-[244px] h-[244px] sm:w-[272px] sm:h-[272px] rounded-full focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-[#6d1d36]/40 cursor-pointer disabled:cursor-wait"
+        className={`relative z-10 w-[244px] h-[244px] sm:w-[272px] sm:h-[272px] rounded-full focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-[#6d1d36]/40 cursor-pointer ${
+          isSpinning ? 'disabled:cursor-wait' : 'disabled:cursor-not-allowed'
+        }`}
       >
         <div
           className={`w-full h-full ${

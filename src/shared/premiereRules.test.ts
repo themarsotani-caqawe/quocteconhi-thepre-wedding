@@ -2,76 +2,117 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   GUEST_ENTRIES,
+  TEAM_CAPACITY,
   TEAM_IDS,
   TOTAL_PEOPLE,
   computeEligibleTeams,
   computeWheelTargetAngle,
+  formatTeamsClipboardText,
   getTeamAtWheelAngle,
-  getTeamCapacities,
   getTeamSeatCounts,
   pickRandomEligibleTeam,
+  type RoomPublicState,
   type TeamId,
-} from './premiereRules';
+} from './premiereRules.ts';
 
-test('guest list totals exactly 25 people across 20 entries with 5 pairs including Thanh Phương', () => {
+test('TEAM_CAPACITY is 5 and TOTAL_PEOPLE is 20 across 4 teams while guest roster keeps all 20 entries', () => {
+  assert.equal(TEAM_CAPACITY, 5);
+  assert.equal(TOTAL_PEOPLE, 20);
   assert.equal(GUEST_ENTRIES.length, 20);
-  const totalSeats = GUEST_ENTRIES.reduce((sum, entry) => sum + entry.seats, 0);
-  assert.equal(totalSeats, TOTAL_PEOPLE);
-  assert.equal(TOTAL_PEOPLE, 25);
-  assert.ok(GUEST_ENTRIES.some((entry) => entry.label === 'Thanh Phương' && entry.seats === 1));
-  const pairs = GUEST_ENTRIES.filter((entry) => entry.seats === 2);
-  assert.equal(pairs.length, 5);
-  for (const pair of pairs) {
-    assert.ok(pair.label.includes('&'));
-    assert.equal(pair.members.length, 2);
-  }
+  assert.ok(GUEST_ENTRIES.some((entry) => entry.label === 'Thanh Phương'));
 });
 
-test('all 5 pairs spinning LAST still guarantees 3 teams of 6 and 1 team of 7 across all bonusTeamId options', () => {
-  const singles = GUEST_ENTRIES.filter((e) => e.seats === 1);
-  const pairs = GUEST_ENTRIES.filter((e) => e.seats === 2);
+test('computeEligibleTeams strictly excludes any team at 5/5 capacity', () => {
+  const assignments: Record<string, TeamId> = {
+    'celine-phang': 1,
+    'cao-thu': 1,
+    'phuong-thuy': 1,
+    'trong-hieu': 1,
+    'hong-nhung': 1, // Đội 1 is now 5/5
+    'nhat-quang': 2,
+    'lan-anh': 2,
+    'mina': 2,
+    'tuan-anh': 2, // Đội 2 is 4/5
+  };
 
-  for (const bonusTeamId of TEAM_IDS) {
-    const expected = getTeamCapacities(bonusTeamId);
-    for (let trial = 0; trial < 100; trial++) {
-      const assignments: Record<string, TeamId> = {};
-      for (const entry of singles) {
-        assignments[entry.id] = pickRandomEligibleTeam(assignments, entry.id, Math.random, bonusTeamId);
-      }
-      for (const pair of pairs) {
-        const eligible = computeEligibleTeams(assignments, pair.id, bonusTeamId);
-        assert.ok(eligible.length >= 1, `No eligible team left for pair ${pair.label} on trial ${trial}`);
-        assignments[pair.id] = pickRandomEligibleTeam(assignments, pair.id, Math.random, bonusTeamId);
-      }
+  const soloEligible = computeEligibleTeams(assignments, 'thanh-dang');
+  assert.deepEqual(soloEligible, [2, 3, 4]);
 
-      const counts = getTeamSeatCounts(assignments);
-      for (const teamId of TEAM_IDS) {
-        assert.equal(counts[teamId], expected[teamId], `Team ${teamId} expected ${expected[teamId]}`);
-      }
-    }
-  }
+  const pairEligible = computeEligibleTeams(assignments, 'sam-chun');
+  assert.deepEqual(pairEligible, [3, 4]);
 });
 
-test('500 random spin permutations always yield exact 25-person distribution with all pairs together', () => {
-  for (let trial = 0; trial < 500; trial++) {
-    const bonusTeamId = TEAM_IDS[trial % TEAM_IDS.length];
-    const expected = getTeamCapacities(bonusTeamId);
-    const shuffled = [...GUEST_ENTRIES].sort(() => Math.random() - 0.5);
-    const assignments: Record<string, TeamId> = {};
-    for (const entry of shuffled) {
-      assignments[entry.id] = pickRandomEligibleTeam(assignments, entry.id, Math.random, bonusTeamId);
-    }
-    assert.equal(Object.keys(assignments).length, GUEST_ENTRIES.length);
-    const counts = getTeamSeatCounts(assignments);
-    for (const teamId of TEAM_IDS) {
-      assert.equal(counts[teamId], expected[teamId]);
-    }
-  }
-});
+test('when all 4 teams reach 5/5 capacity, computeEligibleTeams returns empty and pickRandomEligibleTeam throws full message', () => {
+  const assignments: Record<string, TeamId> = {
+    'celine-phang': 1,
+    'cao-thu': 1,
+    'phuong-thuy': 1,
+    'trong-hieu': 1,
+    'hong-nhung': 1,
+    'nhat-quang': 2,
+    'lan-anh': 2,
+    'mina': 2,
+    'tuan-anh': 2,
+    'thanh-dang': 2,
+    'phuong-thuy-bui': 3,
+    'bao-khanh': 3,
+    'tat-thinh': 3,
+    'gia-thuy': 3,
+    'thanh-phuong': 3,
+    'sam-chun': 4,
+    'anh-xu-con-trai': 4,
+    'to-to-dat-le': 4, // wait: 2+2+2=6; use 1 pair + ... wait use singles/pairs = 5:
+  };
+  delete assignments['to-to-dat-le'];
+  // Wait: put 1 single in team 4? Let's use 2 pairs + 1 single or check counts
+  const full20: Record<string, TeamId> = {
+    'celine-phang': 1,
+    'cao-thu': 1,
+    'phuong-thuy': 1,
+    'trong-hieu': 1,
+    'hong-nhung': 1,
+    'nhat-quang': 2,
+    'lan-anh': 2,
+    'mina': 2,
+    'tuan-anh': 2,
+    'thanh-dang': 2,
+    'phuong-thuy-bui': 3,
+    'bao-khanh': 3,
+    'tat-thinh': 3,
+    'gia-thuy': 3,
+    'thanh-phuong': 3,
+    'sam-chun': 4,
+    'anh-xu-con-trai': 4,
+  };
+  // Team 4 currently has 4 seats (sam-chun + anh-xu-con-trai); let's keep 3 singles + 1 pair? Only 15 singles exist so 5+5+5=15 singles used!
+  // Re-balance: put 1 pair in team 1 (3 singles + 1 pair = 5), 1 single free for team 4!
+  const balancedFull: Record<string, TeamId> = {
+    'celine-phang': 1,
+    'cao-thu': 1,
+    'phuong-thuy': 1,
+    'sam-chun': 1,
+    'trong-hieu': 2,
+    'hong-nhung': 2,
+    'nhat-quang': 2,
+    'lan-anh': 2,
+    'mina': 2,
+    'tuan-anh': 3,
+    'thanh-dang': 3,
+    'phuong-thuy-bui': 3,
+    'bao-khanh': 3,
+    'tat-thinh': 3,
+    'gia-thuy': 4,
+    'anh-xu-con-trai': 4,
+    'to-to-dat-le': 4,
+  };
 
-test('computeEligibleTeams returns existing team when entry was already assigned', () => {
-  const assignments: Record<string, TeamId> = { 'celine-phang': 3 };
-  assert.deepEqual(computeEligibleTeams(assignments, 'celine-phang'), [3]);
+  const counts = getTeamSeatCounts(balancedFull);
+  assert.deepEqual(counts, { 1: 5, 2: 5, 3: 5, 4: 5 });
+  assert.deepEqual(computeEligibleTeams(balancedFull, 'thanh-phuong'), []);
+  assert.throws(
+    () => pickRandomEligibleTeam(balancedFull, 'thanh-phuong'),
+    /Tất cả các đội đã đủ thành viên/
+  );
 });
 
 test('wheel target angle always lands under the top pointer for the assigned team', () => {
@@ -81,13 +122,51 @@ test('wheel target angle always lands under the top pointer for the assigned tea
     for (const teamId of TEAM_IDS) {
       for (const jitter of jitters) {
         const targetAngle = computeWheelTargetAngle(start, teamId, jitter);
-        assert.ok(targetAngle - start >= 5 * 360, 'Wheel should spin at least 5 full turns');
-        assert.equal(
-          getTeamAtWheelAngle(targetAngle),
-          teamId,
-          `Expected team ${teamId} at angle ${targetAngle} (from ${start}, jitter ${jitter})`
-        );
+        assert.ok(targetAngle - start >= 5 * 360);
+        assert.equal(getTeamAtWheelAngle(targetAngle), teamId);
       }
     }
   }
+});
+
+test('formatTeamsClipboardText formats status and member names cleanly', () => {
+  const sample: RoomPublicState = {
+    room: 'live',
+    epoch: 'e1',
+    totalPeopleAssigned: 6,
+    totalPeople: 20,
+    isAllFull: false,
+    assignments: { 'celine-phang': 1 },
+    teams: {
+      1: {
+        teamId: 1,
+        memberCount: 5,
+        capacity: 5,
+        isFull: true,
+        isOpened: false,
+        openedAt: null,
+        members: [
+          { entryId: 'celine-phang', memberName: 'Céline Phang', avatarSeed: 0, isPair: false, pairGroupId: null },
+        ],
+        bag: null,
+      },
+      2: {
+        teamId: 2,
+        memberCount: 1,
+        capacity: 5,
+        isFull: false,
+        isOpened: false,
+        openedAt: null,
+        members: [{ entryId: 'mina', memberName: 'Mina', avatarSeed: 11, isPair: false, pairGroupId: null }],
+        bag: null,
+      },
+      3: { teamId: 3, memberCount: 0, capacity: 5, isFull: false, isOpened: false, openedAt: null, members: [], bag: null },
+      4: { teamId: 4, memberCount: 0, capacity: 5, isFull: false, isOpened: false, openedAt: null, members: [], bag: null },
+    },
+  };
+
+  const text = formatTeamsClipboardText(sample);
+  assert.ok(text.includes('Đội 1 (5/5 người · Đã đủ (5/5))'));
+  assert.ok(text.includes('Đội 2 (1/5 người · Chưa đủ (còn thiếu 4 người))'));
+  assert.ok(text.includes('Mina'));
 });

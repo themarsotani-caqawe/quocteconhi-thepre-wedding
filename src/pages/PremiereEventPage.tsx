@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion } from 'motion/react';
+import { Lock } from 'lucide-react';
 import { AgendaView } from '../components/AgendaView';
 import {
   BrandBadge,
@@ -8,16 +9,16 @@ import {
 } from '../components/CarnivalPlaque';
 import { CurtainFrame } from '../components/CurtainFrame';
 import { NameSelectorSheet } from '../components/NameSelectorSheet';
+import { OwnerDashboard } from '../components/OwnerDashboard';
 import { PremiereMarqueeHeader } from '../components/PremiereMarqueeHeader';
 import { PrizeWheel } from '../components/PrizeWheel';
 import { TeamView } from '../components/TeamView';
 import {
-  autofillRoomExceptOneLocally,
-  loadRoomState,
-  openBagLocally,
-  resetRoomLocally,
-  spinEntryLocally,
-} from '../lib/localPremiereStore';
+  clearDeviceSpinLock,
+  readDeviceSpinLock,
+  writeDeviceSpinLock,
+  type DeviceSpinLock,
+} from '../lib/deviceSpinLock';
 import {
   ENTRY_BY_ID,
   computeWheelTargetAngle,
@@ -31,25 +32,30 @@ function getRoomFromSearch(): 'live' | 'demo' {
   return params.get('demo') === '1' ? 'demo' : 'live';
 }
 
+function getIsOwnerFromSearch(): boolean {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('owner') === 'true';
+}
+
 export function PremiereEventPage() {
   const room = useMemo(() => getRoomFromSearch(), []);
-  const storageKey = `qtcnhi_viewer_entry_${room}`;
+  const isOwner = useMemo(() => getIsOwnerFromSearch(), []);
 
-  const [roomState, setRoomState] = useState<RoomPublicState>(() => loadRoomState(room));
+  const [roomState, setRoomState] = useState<RoomPublicState | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  // Strict per-device lock stored in BOTH localStorage & cookie
+  const [deviceLock, setDeviceLock] = useState<DeviceSpinLock | null>(() =>
+    readDeviceSpinLock(room)
+  );
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(() => {
-    try {
-      const saved = localStorage.getItem(storageKey);
-      return saved && ENTRY_BY_ID.has(saved) ? saved : null;
-    } catch {
-      return null;
-    }
+    const initialLock = readDeviceSpinLock(room);
+    return initialLock ? initialLock.entryId : null;
   });
 
   // Explicit UI tab ('spin' = "Quay tìm đội", 'agenda' = "Agenda")
   const [activeTab, setActiveTab] = useState<'spin' | 'agenda'>('spin');
 
-  // Explicit override so a guest can switch back to Wheel view when picking another name
-  const [forceWheelView, setForceWheelView] = useState(false);
   const [isSheetOpen, setIsSheetOpen] = useState(false);
 
   // Spin state
@@ -63,149 +69,308 @@ export function PremiereEventPage() {
   const [openError, setOpenError] = useState<string | null>(null);
   const openBagTimerRef = useRef<number | null>(null);
 
-  // Persist only the currently viewed guest entry ID locally
-  useEffect(() => {
-    try {
-      if (selectedEntryId) {
-        localStorage.setItem(storageKey, selectedEntryId);
-      } else {
-        localStorage.removeItem(storageKey);
+  const reconcileLockWithState = useCallback(
+    (nextState: RoomPublicState) => {
+      const verified = readDeviceSpinLock(room, nextState.epoch);
+      setDeviceLock(verified);
+      if (verified) {
+        setSelectedEntryId(verified.entryId);
       }
-    } catch {
-      // ignore storage errors
-    }
-  }, [selectedEntryId, storageKey]);
+    },
+    [room]
+  );
 
-  // Sync across tabs on the same browser and clean up timers on unmount
+  const fetchLatestState = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/state?room=${room}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error('Không tải được dữ liệu sự kiện');
+      const data = (await res.json()) as RoomPublicState;
+      setRoomState(data);
+      reconcileLockWithState(data);
+      setLoadError(null);
+    } catch {
+      setLoadError('Đang kết nối lại dữ liệu chung…');
+    }
+  }, [reconcileLockWithState, room]);
+
+  // Real-time SSE + periodic sync fallback across phones
   useEffect(() => {
-    const handleStorage = () => {
-      setRoomState(loadRoomState(room));
+    void fetchLatestState();
+
+    let source: EventSource | null = null;
+    let reconnectTimer: number | null = null;
+    let closed = false;
+
+    const connectSse = () => {
+      if (closed) return;
+      source = new EventSource(`/api/events?room=${room}`);
+      source.addEventListener('state', (event) => {
+        try {
+          const next = JSON.parse((event as MessageEvent).data) as RoomPublicState;
+          setRoomState(next);
+          reconcileLockWithState(next);
+          setLoadError(null);
+        } catch {
+          // ignore malformed chunk
+        }
+      });
+      source.onerror = () => {
+        source?.close();
+        if (!closed && reconnectTimer === null) {
+          reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = null;
+            void fetchLatestState();
+            connectSse();
+          }, 2500);
+        }
+      };
     };
-    window.addEventListener('storage', handleStorage);
+
+    connectSse();
+
+    const pollInterval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void fetchLatestState();
+      }
+    }, 5000);
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void fetchLatestState();
+      }
+    };
+    const handleOnline = () => {
+      void fetchLatestState();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('online', handleOnline);
 
     return () => {
-      window.removeEventListener('storage', handleStorage);
+      closed = true;
+      source?.close();
+      window.clearInterval(pollInterval);
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       if (spinTimerRef.current !== null) window.clearTimeout(spinTimerRef.current);
       if (openBagTimerRef.current !== null) window.clearTimeout(openBagTimerRef.current);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('online', handleOnline);
     };
-  }, [room]);
+  }, [fetchLatestState, reconcileLockWithState, room]);
 
-  const selectedEntry = selectedEntryId ? ENTRY_BY_ID.get(selectedEntryId) ?? null : null;
+  const effectiveEntryId = deviceLock?.entryId ?? selectedEntryId;
+  const selectedEntry = effectiveEntryId ? ENTRY_BY_ID.get(effectiveEntryId) ?? null : null;
   const assignedTeamId: TeamId | null =
-    selectedEntryId ? roomState.assignments[selectedEntryId] ?? null : null;
+    deviceLock?.teamId ??
+    (effectiveEntryId && roomState ? roomState.assignments[effectiveEntryId] ?? null : null);
 
-  // Show TeamView automatically when the selected guest already has an assigned team
-  // and the wheel is not currently in the middle of a spin animation.
+  const isAllFull = Boolean(roomState?.isAllFull);
+  const isDeviceLocked = Boolean(deviceLock);
+
+  // Show TeamView when this device has completed its spin (or while locked) and wheel isn't spinning
   const showTeamView = Boolean(
-    !forceWheelView && !isSpinning && selectedEntry && assignedTeamId
+    !isSpinning && isDeviceLocked && selectedEntry && assignedTeamId && roomState
+  );
+
+  // Spin button is strictly locked unless:
+  // - roomState loaded
+  // - all 4 teams are NOT 5/5 full
+  // - this device has NOT already spun
+  // - guest has explicitly selected an unassigned name from dropdown
+  // - wheel is not currently spinning
+  const canSpin = Boolean(
+    roomState &&
+      !isAllFull &&
+      !isDeviceLocked &&
+      selectedEntryId &&
+      !roomState.assignments[selectedEntryId] &&
+      !isSpinning
   );
 
   const handleSelectEntry = (entry: GuestEntry) => {
+    if (isDeviceLocked) return;
+    if (roomState?.assignments[entry.id]) return;
     setSelectedEntryId(entry.id);
     setSpinError(null);
     setOpenError(null);
     setIsSheetOpen(false);
-    setForceWheelView(false);
   };
 
-  const handleStartSpin = () => {
-    if (isSpinning) return;
+  const handleStartSpin = async () => {
+    if (isSpinning || isDeviceLocked || isAllFull) return;
     setSpinError(null);
 
     if (!selectedEntryId) {
       setIsSheetOpen(true);
+      setSpinError('Vui lòng chọn tên của bạn trước khi bấm Quay liền tay.');
       return;
     }
 
-    // If already assigned in local browser storage, jump straight to their team
+    if (!roomState) return;
     if (roomState.assignments[selectedEntryId]) {
-      setForceWheelView(false);
+      setSpinError('Tên này đã quay trước đó. Vui lòng chọn tên khác chưa quay.');
       return;
     }
 
     setIsSpinning(true);
     try {
-      const result = spinEntryLocally(room, selectedEntryId);
+      const res = await fetch('/api/spin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room, entryId: selectedEntryId }),
+      });
+      const payload = (await res.json()) as {
+        teamId?: TeamId;
+        alreadyAssigned?: boolean;
+        state?: RoomPublicState;
+        error?: string;
+      };
 
-      if (result.alreadyAssigned) {
-        setRoomState(result.state);
+      if (!res.ok || !payload.teamId || !payload.state) {
+        throw new Error(payload.error || 'Chưa thể lưu lượt quay, thử lại nhé.');
+      }
+
+      const assigned = payload.teamId;
+      const latestState = payload.state;
+
+      if (payload.alreadyAssigned) {
+        setRoomState(latestState);
         setIsSpinning(false);
-        setForceWheelView(false);
+        setSpinError('Tên này vừa được quay ở một thiết bị khác. Hãy chọn lại tên của bạn.');
+        setSelectedEntryId(null);
         return;
       }
 
-      const nextAngle = computeWheelTargetAngle(wheelAngle, result.teamId);
+      const nextAngle = computeWheelTargetAngle(wheelAngle, assigned);
       setWheelAngle(nextAngle);
-      setRoomState(result.state);
+      setRoomState(latestState);
 
       spinTimerRef.current = window.setTimeout(() => {
+        const lock: DeviceSpinLock = {
+          epoch: latestState.epoch,
+          entryId: selectedEntryId,
+          teamId: assigned,
+          spunAt: new Date().toISOString(),
+        };
+        writeDeviceSpinLock(room, lock);
+        setDeviceLock(lock);
         setIsSpinning(false);
-        setForceWheelView(false);
       }, 4350);
     } catch (err) {
+      await fetchLatestState();
       setIsSpinning(false);
       setSpinError(
-        err instanceof Error ? err.message : 'Chưa thể quay tìm đội lúc này, thử lại nhé.'
+        err instanceof Error ? err.message : 'Mạng tạm gián đoạn, vui lòng thử lại.'
       );
     }
   };
 
-  const handleOpenBag = () => {
+  const handleOpenBag = async () => {
     if (!assignedTeamId || isOpeningBag) return;
     setOpenError(null);
     setIsOpeningBag(true);
 
-    const result = openBagLocally(room, assignedTeamId, selectedEntryId ?? undefined);
-    if (!result.ok) {
+    try {
+      const res = await fetch('/api/open-bag', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          room,
+          teamId: assignedTeamId,
+          entryId: effectiveEntryId,
+        }),
+      });
+      const payload = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        state?: RoomPublicState;
+      };
+
+      if (!res.ok || !payload.ok || !payload.state) {
+        throw new Error(payload.error || 'Chưa thể khui túi mù.');
+      }
+
+      openBagTimerRef.current = window.setTimeout(() => {
+        if (payload.state) setRoomState(payload.state);
+        setIsOpeningBag(false);
+      }, 450);
+    } catch (err) {
       setIsOpeningBag(false);
-      setOpenError(result.error || 'Chưa thể khui túi mù.');
-      return;
+      setOpenError(err instanceof Error ? err.message : 'Không thể khui túi mù lúc này.');
     }
+  };
 
-    // Hold brief opening animation state so the bow unties before settling
-    openBagTimerRef.current = window.setTimeout(() => {
-      setRoomState(result.state);
+  const handleOwnerReset = async () => {
+    const res = await fetch('/api/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ room, owner: true }),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { state: RoomPublicState };
+      clearDeviceSpinLock(room);
+      setDeviceLock(null);
+      setSelectedEntryId(null);
+      setRoomState(data.state);
+      setIsSpinning(false);
       setIsOpeningBag(false);
-    }, 450);
+      setSpinError(null);
+      setOpenError(null);
+    }
   };
 
-  const handleSwitchViewer = () => {
-    setSelectedEntryId(null);
-    setForceWheelView(true);
-    setOpenError(null);
-    setSpinError(null);
-    setIsSheetOpen(true);
-  };
-
-  const handleResetLocalRoom = () => {
-    const fresh = resetRoomLocally(room);
-    setRoomState(fresh);
-    setSelectedEntryId(null);
-    setForceWheelView(false);
-    setIsSpinning(false);
-    setIsOpeningBag(false);
-    setSpinError(null);
-    setOpenError(null);
-    setIsSheetOpen(false);
-  };
-
-  const handleDemoAutofill = () => {
+  const handleDemoAutofill = async () => {
     const targetEntry = selectedEntryId || 'celine-phang';
-    const next = autofillRoomExceptOneLocally('demo', targetEntry);
-    setRoomState(next);
-    if (!selectedEntryId) {
-      setSelectedEntryId(targetEntry);
+    const res = await fetch('/api/demo/autofill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ room: 'demo', keepEntryId: targetEntry }),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { state: RoomPublicState };
+      setRoomState(data.state);
+      const assigned = data.state.assignments[targetEntry];
+      if (assigned) {
+        const lock: DeviceSpinLock = {
+          epoch: data.state.epoch,
+          entryId: targetEntry,
+          teamId: assigned,
+          spunAt: new Date().toISOString(),
+        };
+        writeDeviceSpinLock('demo', lock);
+        setDeviceLock(lock);
+        setSelectedEntryId(targetEntry);
+      }
     }
-    setForceWheelView(false);
   };
 
-  const handleDemoReset = () => {
-    handleResetLocalRoom();
+  const handleDemoReset = async () => {
+    const res = await fetch('/api/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ room: 'demo', owner: true }),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { state: RoomPublicState };
+      clearDeviceSpinLock('demo');
+      setDeviceLock(null);
+      setSelectedEntryId(null);
+      setRoomState(data.state);
+      setIsSpinning(false);
+      setIsOpeningBag(false);
+      setSpinError(null);
+      setOpenError(null);
+    }
   };
+
+  let spinButtonLabel = 'Quay liền tay';
+  if (isSpinning) spinButtonLabel = 'Đang quay tìm đội…';
+  else if (isAllFull) spinButtonLabel = 'Tất cả các đội đã đủ thành viên';
+  else if (isDeviceLocked) spinButtonLabel = 'Thiết bị đã hoàn tất lượt quay';
 
   return (
     <CurtainFrame>
-      {/* Demo-only sandbox helper bar (completely absent in live guest URL) */}
+      {/* Demo-only sandbox helper bar */}
       {room === 'demo' && (
         <div
           data-testid="demo-toolbar"
@@ -238,7 +403,7 @@ export function PremiereEventPage() {
 
         <PremiereMarqueeHeader className="mt-1" />
 
-        {/* Event Date & Venue Line ("28.11.2026 · LÀ HOME") */}
+        {/* Event Date & Venue Line */}
         <div className="mt-1 rounded-2xl bg-[#fdfbf2]/95 border-[1.5px] border-[#6d1d36] px-3 py-1 text-center shadow-[0_2px_0_rgba(109,29,54,0.12)] w-full">
           <div className="flex items-center justify-center gap-1.5 text-[12.5px] font-bold text-[#6d1d36] tabular-nums">
             <GoldStar className="w-3 h-3" />
@@ -312,14 +477,20 @@ export function PremiereEventPage() {
         </div>
       ) : (
         <div role="tabpanel" id="panel-spin" aria-labelledby="tab-spin" className="flex-1 flex flex-col">
-          {showTeamView && assignedTeamId && selectedEntry ? (
+          {loadError && !roomState && (
+            <div className="my-auto text-center text-sm font-medium text-[#6d1d36]">
+              {loadError}
+            </div>
+          )}
+
+          {showTeamView && roomState && assignedTeamId && selectedEntry ? (
             <TeamView
               team={roomState.teams[assignedTeamId]}
               viewerEntry={selectedEntry}
               isOpening={isOpeningBag}
               openError={openError}
+              deviceLocked={isDeviceLocked}
               onOpenBag={handleOpenBag}
-              onSwitchViewer={handleSwitchViewer}
             />
           ) : (
             <motion.div
@@ -334,42 +505,65 @@ export function PremiereEventPage() {
                 <PrizeWheel
                   angle={wheelAngle}
                   isSpinning={isSpinning}
-                  inviteBounce={Boolean(selectedEntryId && !assignedTeamId)}
+                  inviteBounce={Boolean(canSpin)}
                   onWheelClick={handleStartSpin}
+                  disabled={!canSpin}
                 />
               </div>
 
-              {/* Name Selector & Spin CTA (bright and ready immediately on load) */}
+              {/* All-Full Notice or Name Requirement Helper + Spin CTA */}
               <div className="flex flex-col gap-2">
+                {isAllFull && (
+                  <div
+                    role="status"
+                    data-testid="all-teams-full-banner"
+                    className="rounded-xl border-2 border-[#6d1d36] bg-[#fef2b8] px-3 py-2 text-center text-xs font-bold text-[#6d1d36] flex items-center justify-center gap-1.5"
+                  >
+                    <Lock className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    <span>Tất cả các đội đã đủ thành viên</span>
+                  </div>
+                )}
+
                 {spinError && (
                   <p role="alert" className="text-xs font-medium text-[#9e1c38] text-center">
                     {spinError}
                   </p>
                 )}
 
+                {!isAllFull && !isDeviceLocked && !selectedEntryId && !spinError && (
+                  <p className="text-[11.5px] font-medium text-[#6d1d36]/80 text-center">
+                    Vui lòng chọn tên của bạn trong danh sách trước khi bấm quay
+                  </p>
+                )}
+
                 <NameSelectorSheet
                   isOpen={isSheetOpen}
-                  selectedEntryId={selectedEntryId}
-                  assignments={roomState.assignments}
-                  totalAssigned={roomState.totalPeopleAssigned}
+                  selectedEntryId={effectiveEntryId}
+                  assignments={roomState?.assignments ?? {}}
+                  totalAssigned={roomState?.totalPeopleAssigned ?? 0}
+                  deviceLocked={isDeviceLocked}
                   onOpen={() => setIsSheetOpen(true)}
                   onClose={() => setIsSheetOpen(false)}
                   onSelect={handleSelectEntry}
-                  onResetLocal={handleResetLocalRoom}
-                  disabled={isSpinning}
+                  disabled={isSpinning || !roomState || isAllFull}
                 />
 
                 <CarnivalButton
                   type="button"
                   variant="pink"
                   onClick={handleStartSpin}
-                  disabled={isSpinning}
+                  disabled={!canSpin}
                   data-testid="spin-cta-button"
                 >
-                  {isSpinning ? 'Đang quay tìm đội…' : 'Quay liền tay'}
+                  <span className="text-[17px] sm:text-[19px]">{spinButtonLabel}</span>
                 </CarnivalButton>
               </div>
             </motion.div>
+          )}
+
+          {/* Owner Dashboard rendered right below the wheel / team card when ?owner=true */}
+          {isOwner && roomState && (
+            <OwnerDashboard roomState={roomState} onResetAll={handleOwnerReset} />
           )}
         </div>
       )}

@@ -1,5 +1,4 @@
-import { useState } from 'react';
-import { ChevronDown, Check, RotateCcw, X } from 'lucide-react';
+import { ChevronDown, Check, Lock, X } from 'lucide-react';
 import { GUEST_ENTRIES, TOTAL_PEOPLE, type GuestEntry, type TeamId } from '../shared/premiereRules';
 
 interface NameSelectorSheetProps {
@@ -7,10 +6,10 @@ interface NameSelectorSheetProps {
   selectedEntryId: string | null;
   assignments: Record<string, TeamId>;
   totalAssigned?: number;
+  deviceLocked?: boolean;
   onOpen: () => void;
   onClose: () => void;
   onSelect: (entry: GuestEntry) => void;
-  onResetLocal?: () => void;
   disabled?: boolean;
 }
 
@@ -19,31 +18,25 @@ export function NameSelectorSheet({
   selectedEntryId,
   assignments,
   totalAssigned = 0,
+  deviceLocked = false,
   onOpen,
   onClose,
   onSelect,
-  onResetLocal,
   disabled = false,
 }: NameSelectorSheetProps) {
   const selectedEntry = GUEST_ENTRIES.find((e) => e.id === selectedEntryId) ?? null;
-  const [confirmingReset, setConfirmingReset] = useState(false);
-
-  const handleClose = () => {
-    setConfirmingReset(false);
-    onClose();
-  };
 
   return (
     <>
-      {/* Trigger button styled like the mockup dropdown */}
+      {/* Dropdown trigger */}
       <button
         type="button"
         onClick={onOpen}
-        disabled={disabled}
+        disabled={disabled || deviceLocked}
         data-testid="name-selector-trigger"
         aria-haspopup="dialog"
         aria-expanded={isOpen}
-        className="w-full min-h-[48px] rounded-xl bg-[#fdfbf2] border-2 border-[#6d1d36] px-4 py-2.5 flex items-center justify-between gap-2 text-left shadow-[0_2px_0_rgba(109,29,54,0.14)] hover:bg-[#faf4de] transition-colors cursor-pointer disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#6d1d36]"
+        className="w-full min-h-[48px] rounded-xl bg-[#fdfbf2] border-2 border-[#6d1d36] px-4 py-2.5 flex items-center justify-between gap-2 text-left shadow-[0_2px_0_rgba(109,29,54,0.14)] hover:bg-[#faf4de] transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#6d1d36]"
       >
         <span
           className={`font-display text-[17px] truncate ${
@@ -52,17 +45,21 @@ export function NameSelectorSheet({
         >
           {selectedEntry ? selectedEntry.label : 'Chọn tên của bạn'}
         </span>
-        <ChevronDown className="w-5 h-5 text-[#6d1d36] shrink-0" aria-hidden="true" />
+        {deviceLocked ? (
+          <Lock className="w-4 h-4 text-[#6d1d36] shrink-0" aria-hidden="true" />
+        ) : (
+          <ChevronDown className="w-5 h-5 text-[#6d1d36] shrink-0" aria-hidden="true" />
+        )}
       </button>
 
-      {/* Modal / Bottom Sheet */}
-      {isOpen && (
+      {/* Dropdown Modal / Bottom Sheet */}
+      {isOpen && !deviceLocked && (
         <div
           role="dialog"
           aria-modal="true"
           aria-label="Chọn tên khách mời"
           className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-[#531227]/45 backdrop-blur-[2px] p-0 sm:p-4"
-          onClick={handleClose}
+          onClick={onClose}
         >
           <div
             className="w-full max-w-[440px] max-h-[82dvh] rounded-t-[28px] sm:rounded-[28px] bg-[#fdfbf2] border-2 border-[#6d1d36] shadow-2xl flex flex-col overflow-hidden"
@@ -75,12 +72,12 @@ export function NameSelectorSheet({
                   Chọn tên của bạn
                 </h2>
                 <p className="text-xs text-[#6d1d36]/75 mt-0.5 tabular-nums">
-                  {totalAssigned}/{TOTAL_PEOPLE} khách đã quay trên thiết bị này
+                  Đã có {totalAssigned}/{TOTAL_PEOPLE} vị trí vào đội · Tên đã quay sẽ được khóa
                 </p>
               </div>
               <button
                 type="button"
-                onClick={handleClose}
+                onClick={onClose}
                 aria-label="Đóng danh sách tên"
                 className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-full text-[#6d1d36] hover:bg-[#f8bed0]/40 cursor-pointer"
               >
@@ -92,19 +89,29 @@ export function NameSelectorSheet({
             <div className="overflow-y-auto px-3 py-2.5 divide-y divide-[#6d1d36]/10">
               {GUEST_ENTRIES.map((entry) => {
                 const assignedTeam = assignments[entry.id];
+                const isAssigned = Boolean(assignedTeam);
                 const isSelected = entry.id === selectedEntryId;
                 return (
                   <button
                     key={entry.id}
                     type="button"
+                    disabled={isAssigned}
                     onClick={() => onSelect(entry)}
                     data-testid={`guest-option-${entry.id}`}
-                    className={`w-full min-h-[50px] px-3.5 py-2.5 flex items-center justify-between gap-3 text-left rounded-xl transition-colors cursor-pointer ${
-                      isSelected ? 'bg-[#fbd4df]/65' : 'hover:bg-[#fceef2]'
+                    className={`w-full min-h-[50px] px-3.5 py-2.5 flex items-center justify-between gap-3 text-left rounded-xl transition-colors ${
+                      isAssigned
+                        ? 'opacity-55 bg-[#f3ece4] cursor-not-allowed'
+                        : isSelected
+                          ? 'bg-[#fbd4df]/65 cursor-pointer'
+                          : 'hover:bg-[#fceef2] cursor-pointer'
                     }`}
                   >
                     <div className="min-w-0 flex-1">
-                      <div className="font-display font-bold text-[17px] text-[#6d1d36] truncate">
+                      <div
+                        className={`font-display font-bold text-[17px] truncate ${
+                          isAssigned ? 'line-through text-[#6d1d36]/70' : 'text-[#6d1d36]'
+                        }`}
+                      >
                         {entry.label}
                       </div>
                       {entry.seats === 2 && (
@@ -114,15 +121,16 @@ export function NameSelectorSheet({
                       )}
                     </div>
 
-                    <div className="flex items-center gap-2 shrink-0 text-xs font-medium">
+                    <div className="flex items-center gap-1.5 shrink-0 text-xs font-semibold">
                       {assignedTeam ? (
-                        <span className="text-[#6d1d36]/75">
-                          Đội {assignedTeam} · Xem lại
+                        <span className="inline-flex items-center gap-1 rounded-full bg-[#e8dde0] px-2.5 py-0.5 text-[#6d1d36]/80">
+                          <Check className="w-3.5 h-3.5" aria-hidden="true" />
+                          <span>Đã quay · Đội {assignedTeam}</span>
                         </span>
                       ) : (
                         <span className="text-[#a44564]">Chưa quay</span>
                       )}
-                      {isSelected && (
+                      {isSelected && !isAssigned && (
                         <Check className="w-4 h-4 text-[#6d1d36]" aria-hidden="true" />
                       )}
                     </div>
@@ -130,47 +138,6 @@ export function NameSelectorSheet({
                 );
               })}
             </div>
-
-            {/* Quiet local reset footer when at least 1 spin exists on this device */}
-            {onResetLocal && totalAssigned > 0 && (
-              <div className="px-4 py-2.5 border-t border-[#6d1d36]/15 bg-[#faf4de]/65 flex items-center justify-between gap-2">
-                {!confirmingReset ? (
-                  <button
-                    type="button"
-                    data-testid="local-reset-trigger"
-                    onClick={() => setConfirmingReset(true)}
-                    className="mx-auto inline-flex items-center gap-1.5 text-xs font-medium text-[#6d1d36]/75 hover:text-[#6d1d36] underline underline-offset-2 cursor-pointer py-1"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
-                    <span>Xóa lượt quay đã lưu trên máy này</span>
-                  </button>
-                ) : (
-                  <div className="w-full flex items-center justify-between gap-2 text-xs">
-                    <span className="font-medium text-[#6d1d36]">Đặt lại về 0/{TOTAL_PEOPLE}?</span>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setConfirmingReset(false)}
-                        className="rounded-full border border-[#6d1d36]/35 bg-white px-3 py-1 font-semibold text-[#6d1d36] cursor-pointer"
-                      >
-                        Huỷ
-                      </button>
-                      <button
-                        type="button"
-                        data-testid="local-reset-confirm"
-                        onClick={() => {
-                          setConfirmingReset(false);
-                          onResetLocal();
-                        }}
-                        className="rounded-full border border-[#6d1d36] bg-[#f8bed0] px-3 py-1 font-bold text-[#6d1d36] cursor-pointer"
-                      >
-                        Đặt lại
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
           </div>
         </div>
       )}

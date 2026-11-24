@@ -1,15 +1,15 @@
 export type TeamId = 1 | 2 | 3 | 4;
 
 export const TEAM_IDS: readonly TeamId[] = [1, 2, 3, 4] as const;
-export const TEAM_CAPACITY = 6;
-export const TOTAL_PEOPLE = 25;
+export const TEAM_CAPACITY = 5;
+export const TOTAL_PEOPLE = TEAM_IDS.length * TEAM_CAPACITY; // 20 max seats (5 per team)
 
-export function getTeamCapacities(bonusTeamId: TeamId = 4): Record<TeamId, number> {
+export function getTeamCapacities(): Record<TeamId, number> {
   return {
-    1: bonusTeamId === 1 ? 7 : 6,
-    2: bonusTeamId === 2 ? 7 : 6,
-    3: bonusTeamId === 3 ? 7 : 6,
-    4: bonusTeamId === 4 ? 7 : 6,
+    1: TEAM_CAPACITY,
+    2: TEAM_CAPACITY,
+    3: TEAM_CAPACITY,
+    4: TEAM_CAPACITY,
   };
 }
 
@@ -100,8 +100,10 @@ export interface AssignmentRecord {
 
 export interface RoomPublicState {
   room: 'live' | 'demo';
+  epoch: string;
   totalPeopleAssigned: number;
   totalPeople: number;
+  isAllFull: boolean;
   assignments: Record<string, TeamId>;
   teams: Record<TeamId, TeamPublicView>;
 }
@@ -118,15 +120,12 @@ export function getTeamSeatCounts(assignments: Record<string, TeamId>): Record<T
 }
 
 /**
- * Computes all teams that can legally receive `entryId` while guaranteeing
- * that every remaining unassigned pair (seats === 2) can still fit into the
- * remaining 2-seat blocks across all 4 teams:
- *   sum_{t in 1..4} floor((capacities[t] - usedAfter[t]) / 2) >= remainingPairsAfter
+ * Computes all teams that still have capacity for `entryId` without ever
+ * exceeding TEAM_CAPACITY (5 members per team). Any team at 5/5 is excluded.
  */
 export function computeEligibleTeams(
   assignments: Record<string, TeamId>,
-  entryId: string,
-  bonusTeamId: TeamId = 4
+  entryId: string
 ): TeamId[] {
   const entry = ENTRY_BY_ID.get(entryId);
   if (!entry) {
@@ -136,27 +135,10 @@ export function computeEligibleTeams(
     return [assignments[entryId]];
   }
 
-  const capacities = getTeamCapacities(bonusTeamId);
   const used = getTeamSeatCounts(assignments);
-  const remainingPairsAfter = GUEST_ENTRIES.filter(
-    (candidate) =>
-      candidate.id !== entryId && candidate.seats === 2 && assignments[candidate.id] === undefined
-  ).length;
-
   const eligible: TeamId[] = [];
   for (const teamId of TEAM_IDS) {
-    if (used[teamId] + entry.seats > capacities[teamId]) {
-      continue;
-    }
-    const simulated: Record<TeamId, number> = { ...used };
-    simulated[teamId] += entry.seats;
-
-    const totalTwoSeatBlocks = TEAM_IDS.reduce(
-      (sum, id) => sum + Math.floor((capacities[id] - simulated[id]) / 2),
-      0
-    );
-
-    if (totalTwoSeatBlocks >= remainingPairsAfter) {
+    if (used[teamId] < TEAM_CAPACITY && used[teamId] + entry.seats <= TEAM_CAPACITY) {
       eligible.push(teamId);
     }
   }
@@ -167,12 +149,16 @@ export function computeEligibleTeams(
 export function pickRandomEligibleTeam(
   assignments: Record<string, TeamId>,
   entryId: string,
-  randomFloat: () => number = Math.random,
-  bonusTeamId: TeamId = 4
+  randomFloat: () => number = Math.random
 ): TeamId {
-  const eligible = computeEligibleTeams(assignments, entryId, bonusTeamId);
+  const eligible = computeEligibleTeams(assignments, entryId);
   if (eligible.length === 0) {
-    throw new Error('Không còn đội hợp lệ để xếp chỗ.');
+    const used = getTeamSeatCounts(assignments);
+    const allTeamsFull = TEAM_IDS.every((id) => used[id] >= TEAM_CAPACITY);
+    if (allTeamsFull) {
+      throw new Error('Tất cả các đội đã đủ thành viên.');
+    }
+    throw new Error('Các đội còn lại chỉ còn 1 chỗ trống, không đủ 2 chỗ cho cặp đôi này.');
   }
   const raw = randomFloat();
   const clamped = Math.min(Math.max(raw, 0), 0.999999999);
@@ -213,4 +199,21 @@ export function computeWheelTargetAngle(
 
   const extraTurns = 5 * 360;
   return currentAngle + extraTurns + deltaMod;
+}
+
+export function formatTeamsClipboardText(state: RoomPublicState): string {
+  const lines: string[] = [
+    `QUỐC TẾ CÓ NHI — KẾT QUẢ CHIA ĐỘI (${state.totalPeopleAssigned}/${state.totalPeople} thành viên)`,
+    '',
+  ];
+  for (const teamId of TEAM_IDS) {
+    const team = state.teams[teamId];
+    const status = team.isFull
+      ? 'Đã đủ (5/5)'
+      : `Chưa đủ (còn thiếu ${Math.max(0, team.capacity - team.memberCount)} người)`;
+    const memberNames =
+      team.members.length > 0 ? team.members.map((m) => m.memberName).join(', ') : 'Chưa có thành viên';
+    lines.push(`• Đội ${teamId} (${team.memberCount}/${team.capacity} người · ${status}): ${memberNames}`);
+  }
+  return lines.join('\n');
 }

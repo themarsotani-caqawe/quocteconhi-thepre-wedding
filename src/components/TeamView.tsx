@@ -1,4 +1,5 @@
 import { motion } from 'motion/react';
+import { Lock, PartyPopper } from 'lucide-react';
 import {
   type GuestEntry,
   type TeamPublicView,
@@ -17,8 +18,8 @@ interface TeamViewProps {
   viewerEntry: GuestEntry;
   isOpening: boolean;
   openError: string | null;
+  deviceLocked: boolean;
   onOpenBag: () => void;
-  onSwitchViewer: () => void;
 }
 
 export function TeamView({
@@ -26,8 +27,8 @@ export function TeamView({
   viewerEntry,
   isOpening,
   openError,
+  deviceLocked,
   onOpenBag,
-  onSwitchViewer,
 }: TeamViewProps) {
   const remaining = Math.max(0, team.capacity - team.memberCount);
   const emptySlotCount = remaining;
@@ -45,8 +46,27 @@ export function TeamView({
       data-testid="team-view"
       data-team-id={team.teamId}
     >
+      {/* Prominent Celebration Banner with Live Team Count */}
+      <div
+        data-testid="spin-congrats-banner"
+        className="rounded-[22px] border-2 border-[#6d1d36] bg-[#fef2b8] px-3.5 py-2.5 text-center shadow-[0_3px_0_rgba(109,29,54,0.16)] space-y-1"
+      >
+        <div className="flex items-center justify-center gap-1.5 font-display font-bold text-[16px] sm:text-[17px] text-[#6d1d36] leading-snug">
+          <PartyPopper className="w-4 h-4 text-[#a44564] shrink-0" aria-hidden="true" />
+          <span>
+            Chúc mừng {viewerEntry.label} đã gia nhập Đội {team.teamId}!
+          </span>
+        </div>
+        <p
+          data-testid="congrats-team-count"
+          className="text-xs sm:text-[13px] font-semibold text-[#6d1d36]/90 tabular-nums"
+        >
+          Hiện tại Đội {team.teamId} đang có {team.memberCount}/{team.capacity} thành viên
+        </p>
+      </div>
+
       {/* Team Header Plaque */}
-      <div className="flex flex-col items-center gap-2 mt-1">
+      <div className="flex flex-col items-center gap-2">
         <div className="w-full max-w-[300px] rounded-[28px] bg-[#fdfbf2] border-2 border-[#6d1d36] px-4 py-2 shadow-[0_3px_0_rgba(109,29,54,0.16)] relative">
           <div className="rounded-[20px] border border-dashed border-[#6d1d36]/55 py-1.5 px-3 flex items-center justify-center gap-3">
             <GoldStar className="w-4 h-4" />
@@ -60,15 +80,9 @@ export function TeamView({
         <RibbonBanner className="-mt-3 z-10">{ribbonLabel}</RibbonBanner>
       </div>
 
-      {/* 6- or 7-slot Teammates Cloud Card (with readable names under every avatar) */}
+      {/* 5-slot Teammates Cloud Card */}
       <ScallopedCard>
-        <div
-          className={
-            team.capacity > 6
-              ? 'flex flex-wrap justify-center gap-x-2 gap-y-2 items-start'
-              : 'grid grid-cols-3 sm:grid-cols-6 gap-x-1.5 gap-y-2.5 items-start'
-          }
-        >
+        <div className="flex flex-wrap justify-center gap-x-3 gap-y-2.5 items-start">
           {team.members.map((slot, index) => {
             const isViewer = slot.entryId === viewerEntry.id;
             return (
@@ -77,9 +91,7 @@ export function TeamView({
                 initial={{ opacity: 0, scale: 0.9 }}
                 animate={{ opacity: 1, scale: 1 }}
                 transition={{ duration: 0.16, delay: index * 0.015 }}
-                className={`flex flex-col items-center text-center min-w-0 ${
-                  team.capacity > 6 ? 'w-[62px] sm:w-[74px]' : ''
-                }`}
+                className="flex flex-col items-center text-center min-w-0 w-[64px] sm:w-[70px]"
               >
                 <div
                   className={`rounded-full p-0.5 ${
@@ -89,7 +101,7 @@ export function TeamView({
                   <VintageAvatar seed={slot.avatarSeed} size={40} />
                 </div>
                 <span
-                  className={`mt-0.5 text-[11px] leading-[1.15] break-words max-w-[78px] ${
+                  className={`mt-0.5 text-[11px] leading-[1.15] break-words max-w-[74px] ${
                     isViewer ? 'font-bold text-[#6d1d36]' : 'font-semibold text-[#6d1d36]/90'
                   }`}
                 >
@@ -107,9 +119,7 @@ export function TeamView({
           {Array.from({ length: emptySlotCount }).map((_, idx) => (
             <div
               key={`empty-${idx}`}
-              className={`flex flex-col items-center text-center opacity-55 ${
-                team.capacity > 6 ? 'w-[62px] sm:w-[74px]' : ''
-              }`}
+              className="flex flex-col items-center text-center opacity-55 w-[64px] sm:w-[70px]"
               aria-label="Vị trí đang chờ đồng đội"
             >
               <div className="w-[42px] h-[42px] rounded-full border-2 border-dashed border-[#6d1d36]/40 bg-[#f2ebe0] flex items-center justify-center">
@@ -197,17 +207,16 @@ export function TeamView({
           </motion.div>
         )}
 
-        {/* Quiet viewer-switch link (no data reset) */}
-        <div className="pt-1 text-center">
-          <button
-            type="button"
-            onClick={onSwitchViewer}
-            data-testid="switch-viewer-button"
-            className="text-xs font-medium text-[#6d1d36]/75 hover:text-[#6d1d36] underline underline-offset-4 cursor-pointer py-1 px-2"
+        {/* Strict 1-spin-per-device lock badge */}
+        {deviceLocked && (
+          <div
+            data-testid="device-locked-note"
+            className="mt-1 inline-flex items-center gap-1.5 text-[11.5px] font-medium text-[#6d1d36]/75"
           >
-            Đang xem dưới tên {viewerEntry.label} · Đổi tên khác
-          </button>
-        </div>
+            <Lock className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>Thiết bị đã hoàn tất lượt quay cho {viewerEntry.label}</span>
+          </div>
+        )}
       </div>
     </motion.div>
   );
